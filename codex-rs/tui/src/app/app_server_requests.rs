@@ -12,6 +12,7 @@ use codex_app_server_protocol::McpServerElicitationRequestResponse;
 use codex_app_server_protocol::PermissionsRequestApprovalResponse;
 use codex_app_server_protocol::RequestId as AppServerRequestId;
 use codex_app_server_protocol::ServerRequest;
+use codex_protocol::request_permissions::RequestPermissionProfile as CoreRequestPermissionProfile;
 
 impl App {
     pub(super) async fn reject_app_server_request(
@@ -49,12 +50,15 @@ pub(super) struct UnsupportedAppServerRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ResolvedAppServerRequest {
     ExecApproval {
+        thread_id: String,
         id: String,
     },
     FileChangeApproval {
+        thread_id: String,
         id: String,
     },
     PermissionsApproval {
+        thread_id: String,
         id: String,
     },
     UserInput {
@@ -68,14 +72,20 @@ pub(crate) enum ResolvedAppServerRequest {
 
 #[derive(Debug, Default)]
 pub(super) struct PendingAppServerRequests {
-    exec_approvals: HashMap<String, AppServerRequestId>,
-    file_change_approvals: HashMap<String, AppServerRequestId>,
-    permissions_approvals: HashMap<String, AppServerRequestId>,
+    exec_approvals: HashMap<(String, String), AppServerRequestId>,
+    file_change_approvals: HashMap<(String, String), AppServerRequestId>,
+    permissions_approvals: HashMap<(String, String), AppServerRequestId>,
     user_inputs: HashMap<String, VecDeque<PendingUserInputRequest>>,
     mcp_requests: HashMap<McpRequestKey, AppServerRequestId>,
 }
 
 impl PendingAppServerRequests {
+    fn canonical_thread_id(thread_id: &str) -> String {
+        codex_protocol::ThreadId::from_string(thread_id)
+            .map(|thread_id| thread_id.to_string())
+            .unwrap_or_else(|_| thread_id.to_string())
+    }
+
     pub(super) fn clear(&mut self) {
         self.exec_approvals.clear();
         self.file_change_approvals.clear();
@@ -94,17 +104,42 @@ impl PendingAppServerRequests {
                     .approval_id
                     .clone()
                     .unwrap_or_else(|| params.item_id.clone());
-                self.exec_approvals.insert(approval_id, request_id.clone());
+                self.exec_approvals.insert(
+                    (Self::canonical_thread_id(&params.thread_id), approval_id),
+                    request_id.clone(),
+                );
                 None
             }
             ServerRequest::FileChangeRequestApproval { request_id, params } => {
-                self.file_change_approvals
-                    .insert(params.item_id.clone(), request_id.clone());
+                self.file_change_approvals.insert(
+                    (
+                        Self::canonical_thread_id(&params.thread_id),
+                        params.item_id.clone(),
+                    ),
+                    request_id.clone(),
+                );
                 None
             }
             ServerRequest::PermissionsRequestApproval { request_id, params } => {
-                self.permissions_approvals
-                    .insert(params.item_id.clone(), request_id.clone());
+                // TODO(anp): Remove this duplicate validation once core permission paths remain
+                // PathUri after crossing the app-server boundary. Native permission paths do not
+                // yet have an ingress validation step, so validate them here before recording the
+                // request as pending. Discovering an invalid path later in a UI delivery path
+                // would leave the app-server RPC waiting without a clean rejection path.
+                if let Err(err) = CoreRequestPermissionProfile::try_from(params.permissions.clone())
+                {
+                    return Some(UnsupportedAppServerRequest {
+                        request_id: request_id.clone(),
+                        message: format!("failed to localize requested filesystem paths: {err}"),
+                    });
+                }
+                self.permissions_approvals.insert(
+                    (
+                        Self::canonical_thread_id(&params.thread_id),
+                        params.item_id.clone(),
+                    ),
+                    request_id.clone(),
+                );
                 None
             }
             ServerRequest::ToolRequestUserInput { request_id, params } => {
@@ -127,17 +162,18 @@ impl PendingAppServerRequests {
                 );
                 None
             }
-            ServerRequest::DynamicToolCall { request_id, .. } => {
-                Some(UnsupportedAppServerRequest {
-                    request_id: request_id.clone(),
-                    message: "Dynamic tool calls are not available in TUI yet.".to_string(),
-                })
-            }
+            ServerRequest::DynamicToolCall { .. } => None,
             ServerRequest::ChatgptAuthTokensRefresh { .. } => None,
             ServerRequest::AttestationGenerate { request_id, .. } => {
                 Some(UnsupportedAppServerRequest {
                     request_id: request_id.clone(),
                     message: "Attestation generation is not available in TUI.".to_string(),
+                })
+            }
+            ServerRequest::CurrentTimeRead { request_id, .. } => {
+                Some(UnsupportedAppServerRequest {
+                    request_id: request_id.clone(),
+                    message: "External current time is not available in TUI.".to_string(),
                 })
             }
             ServerRequest::ApplyPatchApproval { request_id, .. } => {
@@ -159,16 +195,18 @@ impl PendingAppServerRequests {
 
     pub(super) fn take_resolution<T>(
         &mut self,
+        thread_id: &str,
         op: T,
     ) -> Result<Option<AppServerRequestResolution>, String>
     where
         T: Into<AppCommand>,
     {
+        let thread_id = Self::canonical_thread_id(thread_id);
         let op: AppCommand = op.into();
         let resolution = match &op {
             AppCommand::ExecApproval { id, decision, .. } => self
                 .exec_approvals
-                .remove(id)
+                .remove(&(thread_id, id.clone()))
                 .map(|request_id| {
                     Ok::<AppServerRequestResolution, String>(AppServerRequestResolution {
                         request_id,
@@ -185,7 +223,7 @@ impl PendingAppServerRequests {
                 .transpose()?,
             AppCommand::PatchApproval { id, decision } => self
                 .file_change_approvals
-                .remove(id)
+                .remove(&(thread_id, id.clone()))
                 .map(|request_id| {
                     Ok::<AppServerRequestResolution, String>(AppServerRequestResolution {
                         request_id,
@@ -200,7 +238,7 @@ impl PendingAppServerRequests {
                 .transpose()?,
             AppCommand::RequestPermissionsResponse { id, response } => self
                 .permissions_approvals
-                .remove(id)
+                .remove(&(thread_id, id.clone()))
                 .map(|request_id| {
                     Ok::<AppServerRequestResolution, String>(AppServerRequestResolution {
                         request_id,
@@ -261,33 +299,38 @@ impl PendingAppServerRequests {
 
     pub(super) fn resolve_notification(
         &mut self,
+        thread_id: &str,
         request_id: &AppServerRequestId,
     ) -> Option<ResolvedAppServerRequest> {
-        if let Some(id) = self
-            .exec_approvals
-            .iter()
-            .find_map(|(id, value)| (value == request_id).then(|| id.clone()))
-        {
-            self.exec_approvals.remove(&id);
-            return Some(ResolvedAppServerRequest::ExecApproval { id });
+        let thread_id = Self::canonical_thread_id(thread_id);
+        if let Some(key) = self.exec_approvals.iter().find_map(|(key, value)| {
+            (key.0 == thread_id && value == request_id).then(|| key.clone())
+        }) {
+            self.exec_approvals.remove(&key);
+            return Some(ResolvedAppServerRequest::ExecApproval {
+                thread_id: key.0,
+                id: key.1,
+            });
         }
 
-        if let Some(id) = self
-            .file_change_approvals
-            .iter()
-            .find_map(|(id, value)| (value == request_id).then(|| id.clone()))
-        {
-            self.file_change_approvals.remove(&id);
-            return Some(ResolvedAppServerRequest::FileChangeApproval { id });
+        if let Some(key) = self.file_change_approvals.iter().find_map(|(key, value)| {
+            (key.0 == thread_id && value == request_id).then(|| key.clone())
+        }) {
+            self.file_change_approvals.remove(&key);
+            return Some(ResolvedAppServerRequest::FileChangeApproval {
+                thread_id: key.0,
+                id: key.1,
+            });
         }
 
-        if let Some(id) = self
-            .permissions_approvals
-            .iter()
-            .find_map(|(id, value)| (value == request_id).then(|| id.clone()))
-        {
-            self.permissions_approvals.remove(&id);
-            return Some(ResolvedAppServerRequest::PermissionsApproval { id });
+        if let Some(key) = self.permissions_approvals.iter().find_map(|(key, value)| {
+            (key.0 == thread_id && value == request_id).then(|| key.clone())
+        }) {
+            self.permissions_approvals.remove(&key);
+            return Some(ResolvedAppServerRequest::PermissionsApproval {
+                thread_id: key.0,
+                id: key.1,
+            });
         }
 
         if let Some(pending) = self.remove_user_input_request(request_id) {
@@ -336,11 +379,12 @@ impl PendingAppServerRequests {
                 .mcp_requests
                 .values()
                 .any(|pending_request_id| pending_request_id == request_id),
+            ServerRequest::ChatgptAuthTokensRefresh { .. } => true,
             ServerRequest::DynamicToolCall { .. }
-            | ServerRequest::ChatgptAuthTokensRefresh { .. }
             | ServerRequest::AttestationGenerate { .. }
+            | ServerRequest::CurrentTimeRead { .. }
             | ServerRequest::ApplyPatchApproval { .. }
-            | ServerRequest::ExecCommandApproval { .. } => true,
+            | ServerRequest::ExecCommandApproval { .. } => false,
         }
     }
 
@@ -397,6 +441,7 @@ struct McpRequestKey {
 mod tests {
     use super::PendingAppServerRequests;
     use super::ResolvedAppServerRequest;
+    use super::UnsupportedAppServerRequest;
     use crate::app_command::AppCommand as Op;
     use codex_app_server_protocol::AdditionalFileSystemPermissions;
     use codex_app_server_protocol::AdditionalNetworkPermissions;
@@ -433,11 +478,13 @@ mod tests {
         let request = ServerRequest::CommandExecutionRequestApproval {
             request_id: AppServerRequestId::Integer(41),
             params: CommandExecutionRequestApprovalParams {
+                kind: Default::default(),
                 thread_id: "thread-1".to_string(),
                 turn_id: "turn-1".to_string(),
                 item_id: "call-1".to_string(),
                 started_at_ms: 0,
                 approval_id: Some("approval-1".to_string()),
+                environment_id: None,
                 reason: None,
                 network_approval_context: None,
                 command: Some("ls".to_string()),
@@ -453,16 +500,144 @@ mod tests {
         assert_eq!(pending.note_server_request(&request), None);
 
         let resolution = pending
-            .take_resolution(&Op::ExecApproval {
-                id: "approval-1".to_string(),
-                turn_id: None,
-                decision: CommandExecutionApprovalDecision::Accept,
-            })
+            .take_resolution(
+                "thread-1",
+                &Op::ExecApproval {
+                    id: "approval-1".to_string(),
+                    turn_id: None,
+                    decision: CommandExecutionApprovalDecision::Accept,
+                },
+            )
             .expect("resolution should serialize")
             .expect("request should be pending");
 
         assert_eq!(resolution.request_id, AppServerRequestId::Integer(41));
         assert_eq!(resolution.result, json!({ "decision": "accept" }));
+    }
+
+    #[test]
+    fn colliding_approvals_resolve_only_on_their_own_thread() {
+        let approvals = [
+            (
+                "item/commandExecution/requestApproval",
+                Op::ExecApproval {
+                    id: "shared-id".to_string(),
+                    turn_id: None,
+                    decision: CommandExecutionApprovalDecision::Accept,
+                },
+            ),
+            (
+                "item/fileChange/requestApproval",
+                Op::PatchApproval {
+                    id: "shared-id".to_string(),
+                    decision: FileChangeApprovalDecision::Accept,
+                },
+            ),
+            (
+                "item/permissions/requestApproval",
+                Op::RequestPermissionsResponse {
+                    id: "shared-id".to_string(),
+                    response: codex_protocol::request_permissions::RequestPermissionsResponse {
+                        permissions: RequestPermissionProfile::default(),
+                        scope: codex_protocol::request_permissions::PermissionGrantScope::Turn,
+                        strict_auto_review: false,
+                    },
+                },
+            ),
+        ];
+
+        for (method, op) in approvals {
+            let mut pending = PendingAppServerRequests::default();
+            let thread_ids = [
+                codex_protocol::ThreadId::new().to_string(),
+                codex_protocol::ThreadId::new().to_string(),
+            ];
+            for (index, thread_id) in thread_ids.iter().enumerate() {
+                let wire_thread_id = if index == 0 {
+                    thread_id.to_ascii_uppercase()
+                } else {
+                    thread_id.replace('-', "")
+                };
+                let request: ServerRequest = serde_json::from_value(json!({
+                    "method": method,
+                    "id": index + 1,
+                    "params": {
+                        "threadId": wire_thread_id,
+                        "turnId": "turn-1",
+                        "itemId": "shared-id",
+                        "startedAtMs": 0,
+                        "cwd": if cfg!(windows) { r"C:\tmp" } else { "/tmp" },
+                        "permissions": {},
+                    },
+                }))
+                .expect("approval request should deserialize");
+                assert_eq!(pending.note_server_request(&request), None);
+                assert!(pending.contains_server_request(&request));
+            }
+            assert_eq!(
+                pending.resolve_notification(&thread_ids[1], &AppServerRequestId::Integer(1)),
+                None
+            );
+
+            for (thread_id, request_id) in thread_ids.iter().zip(1..=2) {
+                let resolution = pending
+                    .take_resolution(thread_id, &op)
+                    .expect("approval resolution should serialize")
+                    .expect("approval should remain pending on its own thread");
+                assert_eq!(
+                    resolution.request_id,
+                    AppServerRequestId::Integer(request_id)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_permissions_with_paths_that_cannot_be_localized() {
+        let mut pending = PendingAppServerRequests::default();
+        let request_id = AppServerRequestId::Integer(7);
+        let permissions = codex_app_server_protocol::RequestPermissionProfile {
+            network: None,
+            file_system: Some(AdditionalFileSystemPermissions {
+                read: Some(vec![
+                    serde_json::from_value(json!("relative/path"))
+                        .expect("relative API path should deserialize"),
+                ]),
+                write: None,
+                glob_scan_max_depth: None,
+                entries: None,
+            }),
+        };
+        let localization_error =
+            RequestPermissionProfile::try_from(permissions.clone()).expect_err("relative path");
+        let cwd = AbsolutePathBuf::try_from(PathBuf::from(if cfg!(windows) {
+            r"C:\tmp"
+        } else {
+            "/tmp"
+        }))
+        .expect("path must be absolute");
+
+        assert_eq!(
+            pending.note_server_request(&ServerRequest::PermissionsRequestApproval {
+                request_id: request_id.clone(),
+                params: PermissionsRequestApprovalParams {
+                    thread_id: "thread-1".to_string(),
+                    turn_id: "turn-1".to_string(),
+                    item_id: "perm-1".to_string(),
+                    environment_id: None,
+                    started_at_ms: 0,
+                    cwd,
+                    reason: None,
+                    permissions,
+                },
+            }),
+            Some(UnsupportedAppServerRequest {
+                request_id,
+                message: format!(
+                    "failed to localize requested filesystem paths: {localization_error}"
+                ),
+            })
+        );
     }
 
     #[test]
@@ -489,6 +664,7 @@ mod tests {
                     thread_id: "thread-1".to_string(),
                     turn_id: "turn-1".to_string(),
                     item_id: "perm-1".to_string(),
+                    environment_id: None,
                     started_at_ms: 0,
                     cwd: absolute_path(if cfg!(windows) { r"C:\tmp" } else { "/tmp" }),
                     reason: None,
@@ -508,28 +684,33 @@ mod tests {
                     turn_id: "turn-2".to_string(),
                     item_id: "tool-1".to_string(),
                     questions: Vec::new(),
+                    is_blocking: true,
+                    auto_resolution_ms: None,
                 },
             }),
             None
         );
 
         let permissions = pending
-            .take_resolution(&Op::RequestPermissionsResponse {
-                id: "perm-1".to_string(),
-                response: codex_protocol::request_permissions::RequestPermissionsResponse {
-                    permissions: RequestPermissionProfile {
-                        network: Some(NetworkPermissions {
-                            enabled: Some(true),
-                        }),
-                        file_system: Some(FileSystemPermissions::from_read_write_roots(
-                            Some(vec![absolute_path(read_path)]),
-                            Some(vec![absolute_path(write_path)]),
-                        )),
+            .take_resolution(
+                "thread-1",
+                &Op::RequestPermissionsResponse {
+                    id: "perm-1".to_string(),
+                    response: codex_protocol::request_permissions::RequestPermissionsResponse {
+                        permissions: RequestPermissionProfile {
+                            network: Some(NetworkPermissions {
+                                enabled: Some(true),
+                            }),
+                            file_system: Some(FileSystemPermissions::from_read_write_roots(
+                                Some(vec![absolute_path(read_path)]),
+                                Some(vec![absolute_path(write_path)]),
+                            )),
+                        },
+                        scope: codex_protocol::request_permissions::PermissionGrantScope::Session,
+                        strict_auto_review: false,
                     },
-                    scope: codex_protocol::request_permissions::PermissionGrantScope::Session,
-                    strict_auto_review: false,
                 },
-            })
+            )
             .expect("permissions response should serialize")
             .expect("permissions request should be pending");
         assert_eq!(permissions.request_id, AppServerRequestId::Integer(7));
@@ -542,19 +723,19 @@ mod tests {
                         enabled: Some(true),
                     }),
                     file_system: Some(AdditionalFileSystemPermissions {
-                        read: Some(vec![absolute_path(read_path)]),
-                        write: Some(vec![absolute_path(write_path)]),
+                        read: Some(vec![absolute_path(read_path).into()]),
+                        write: Some(vec![absolute_path(write_path).into()]),
                         glob_scan_max_depth: None,
                         entries: Some(vec![
                             codex_app_server_protocol::FileSystemSandboxEntry {
                                 path: codex_app_server_protocol::FileSystemPath::Path {
-                                    path: absolute_path(read_path),
+                                    path: absolute_path(read_path).into(),
                                 },
                                 access: codex_app_server_protocol::FileSystemAccessMode::Read,
                             },
                             codex_app_server_protocol::FileSystemSandboxEntry {
                                 path: codex_app_server_protocol::FileSystemPath::Path {
-                                    path: absolute_path(write_path),
+                                    path: absolute_path(write_path).into(),
                                 },
                                 access: codex_app_server_protocol::FileSystemAccessMode::Write,
                             },
@@ -567,18 +748,21 @@ mod tests {
         );
 
         let user_input = pending
-            .take_resolution(&Op::UserInputAnswer {
-                id: "turn-2".to_string(),
-                response: ToolRequestUserInputResponse {
-                    answers: std::iter::once((
-                        "question".to_string(),
-                        ToolRequestUserInputAnswer {
-                            answers: vec!["yes".to_string()],
-                        },
-                    ))
-                    .collect(),
+            .take_resolution(
+                "thread-1",
+                &Op::UserInputAnswer {
+                    id: "turn-2".to_string(),
+                    response: ToolRequestUserInputResponse {
+                        answers: std::iter::once((
+                            "question".to_string(),
+                            ToolRequestUserInputAnswer {
+                                answers: vec!["yes".to_string()],
+                            },
+                        ))
+                        .collect(),
+                    },
                 },
-            })
+            )
             .expect("user input response should serialize")
             .expect("user input request should be pending");
         assert_eq!(user_input.request_id, AppServerRequestId::Integer(8));
@@ -624,13 +808,16 @@ mod tests {
         );
 
         let resolution = pending
-            .take_resolution(&Op::ResolveElicitation {
-                server_name: "example".to_string(),
-                request_id: AppServerRequestId::Integer(12),
-                decision: McpServerElicitationAction::Accept,
-                content: Some(json!({ "answer": "yes" })),
-                meta: Some(json!({ "source": "tui" })),
-            })
+            .take_resolution(
+                "thread-1",
+                &Op::ResolveElicitation {
+                    server_name: "example".to_string(),
+                    request_id: AppServerRequestId::Integer(12),
+                    decision: McpServerElicitationAction::Accept,
+                    content: Some(json!({ "answer": "yes" })),
+                    meta: Some(json!({ "source": "tui" })),
+                },
+            )
             .expect("elicitation response should serialize")
             .expect("elicitation request should be pending");
 
@@ -642,30 +829,6 @@ mod tests {
                 "content": { "answer": "yes" },
                 "_meta": { "source": "tui" }
             })
-        );
-    }
-
-    #[test]
-    fn rejects_dynamic_tool_calls_as_unsupported() {
-        let mut pending = PendingAppServerRequests::default();
-        let unsupported = pending
-            .note_server_request(&ServerRequest::DynamicToolCall {
-                request_id: AppServerRequestId::Integer(99),
-                params: codex_app_server_protocol::DynamicToolCallParams {
-                    thread_id: "thread-1".to_string(),
-                    turn_id: "turn-1".to_string(),
-                    call_id: "tool-1".to_string(),
-                    namespace: None,
-                    tool: "tool".to_string(),
-                    arguments: json!({}),
-                },
-            })
-            .expect("dynamic tool calls should be rejected");
-
-        assert_eq!(unsupported.request_id, AppServerRequestId::Integer(99));
-        assert_eq!(
-            unsupported.message,
-            "Dynamic tool calls are not available in TUI yet."
         );
     }
 
@@ -704,10 +867,13 @@ mod tests {
         );
 
         let resolution = pending
-            .take_resolution(&Op::PatchApproval {
-                id: "patch-1".to_string(),
-                decision: FileChangeApprovalDecision::Cancel,
-            })
+            .take_resolution(
+                "thread-1",
+                &Op::PatchApproval {
+                    id: "patch-1".to_string(),
+                    decision: FileChangeApprovalDecision::Cancel,
+                },
+            )
             .expect("resolution should serialize")
             .expect("request should be pending");
 
@@ -718,15 +884,18 @@ mod tests {
     #[test]
     fn resolve_notification_returns_resolved_exec_request() {
         let mut pending = PendingAppServerRequests::default();
+        let thread_id = codex_protocol::ThreadId::new().to_string();
         assert_eq!(
             pending.note_server_request(&ServerRequest::CommandExecutionRequestApproval {
                 request_id: AppServerRequestId::Integer(41),
                 params: CommandExecutionRequestApprovalParams {
-                    thread_id: "thread-1".to_string(),
+                    kind: Default::default(),
+                    thread_id: thread_id.to_ascii_uppercase(),
                     turn_id: "turn-1".to_string(),
                     item_id: "call-1".to_string(),
                     started_at_ms: 0,
                     approval_id: Some("approval-1".to_string()),
+                    environment_id: None,
                     reason: None,
                     network_approval_context: None,
                     command: Some("ls".to_string()),
@@ -742,13 +911,17 @@ mod tests {
         );
 
         assert_eq!(
-            pending.resolve_notification(&AppServerRequestId::Integer(41)),
+            pending.resolve_notification(
+                &thread_id.replace('-', ""),
+                &AppServerRequestId::Integer(41)
+            ),
             Some(ResolvedAppServerRequest::ExecApproval {
+                thread_id: thread_id.clone(),
                 id: "approval-1".to_string(),
             })
         );
         assert_eq!(
-            pending.resolve_notification(&AppServerRequestId::Integer(41)),
+            pending.resolve_notification(&thread_id, &AppServerRequestId::Integer(41)),
             None
         );
     }
@@ -779,7 +952,7 @@ mod tests {
         );
 
         assert_eq!(
-            pending.resolve_notification(&AppServerRequestId::Integer(12)),
+            pending.resolve_notification("thread-1", &AppServerRequestId::Integer(12)),
             Some(ResolvedAppServerRequest::McpElicitation {
                 server_name: "example".to_string(),
                 request_id: AppServerRequestId::Integer(12),
@@ -797,11 +970,13 @@ mod tests {
                 turn_id: "turn-1".to_string(),
                 item_id: "tool-1".to_string(),
                 questions: Vec::new(),
+                is_blocking: true,
+                auto_resolution_ms: None,
             },
         });
 
         assert_eq!(
-            pending.resolve_notification(&AppServerRequestId::Integer(8)),
+            pending.resolve_notification("thread-1", &AppServerRequestId::Integer(8)),
             Some(ResolvedAppServerRequest::UserInput {
                 call_id: "tool-1".to_string(),
             })
@@ -819,6 +994,8 @@ mod tests {
                     turn_id: "turn-1".to_string(),
                     item_id: item_id.to_string(),
                     questions: Vec::new(),
+                    is_blocking: true,
+                    auto_resolution_ms: None,
                 },
             });
         }
@@ -827,17 +1004,23 @@ mod tests {
             answers: HashMap::new(),
         };
         let first_response = pending
-            .take_resolution(&Op::UserInputAnswer {
-                id: "turn-1".to_string(),
-                response: response.clone(),
-            })
+            .take_resolution(
+                "thread-1",
+                &Op::UserInputAnswer {
+                    id: "turn-1".to_string(),
+                    response: response.clone(),
+                },
+            )
             .expect("user input response should serialize")
             .expect("first user input request should be pending");
         let second_response = pending
-            .take_resolution(&Op::UserInputAnswer {
-                id: "turn-1".to_string(),
-                response,
-            })
+            .take_resolution(
+                "thread-1",
+                &Op::UserInputAnswer {
+                    id: "turn-1".to_string(),
+                    response,
+                },
+            )
             .expect("user input response should serialize")
             .expect("second user input request should be pending");
 

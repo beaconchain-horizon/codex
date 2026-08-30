@@ -1,11 +1,12 @@
 use anyhow::Context;
 use anyhow::Result;
-use app_test_support::McpProcess;
+use app_test_support::TestAppServer;
 use app_test_support::create_mock_responses_server_sequence_unchecked;
 use codex_app_server_protocol::ProcessExitedNotification;
 use codex_app_server_protocol::ProcessKillParams;
 use codex_app_server_protocol::ProcessSpawnParams;
 use codex_app_server_protocol::RequestId;
+use codex_exec_server::CODEX_EXEC_SERVER_URL_ENV_VAR;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
 use std::collections::HashMap;
@@ -41,7 +42,7 @@ async fn process_spawn_returns_before_exit_and_emits_exit_notification() -> Resu
                 "while (!(Test-Path -LiteralPath $env:CODEX_PROCESS_EXEC_RELEASE_FILE)) { ",
                 "Start-Sleep -Milliseconds 20 ",
                 "}; ",
-                "[Console]::Out.Write('process-out'); ",
+                "[Console]::Out.Write(('process-out|{0}|{1}' -f $env:OpenAI_Federation_Rule_Id, $env:OPENAI_IDENTITY_TOKEN_FILE)); ",
                 "[Console]::Error.Write('process-err')",
             )
             .to_string(),
@@ -53,7 +54,7 @@ async fn process_spawn_returns_before_exit_and_emits_exit_notification() -> Resu
             concat!(
                 "printf process > \"$CODEX_PROCESS_EXEC_PROBE_FILE\"; ",
                 "while [ ! -e \"$CODEX_PROCESS_EXEC_RELEASE_FILE\" ]; do sleep 0.05; done; ",
-                "printf process-out; ",
+                "printf 'process-out|%s|%s' \"$OpenAI_Federation_Rule_Id\" \"$OPENAI_IDENTITY_TOKEN_FILE\"; ",
                 "printf process-err >&2",
             )
             .to_string(),
@@ -67,6 +68,14 @@ async fn process_spawn_returns_before_exit_and_emits_exit_notification() -> Resu
         (
             "CODEX_PROCESS_EXEC_RELEASE_FILE".to_string(),
             Some(release_file.display().to_string()),
+        ),
+        (
+            "OpenAI_Federation_Rule_Id".to_string(),
+            Some("rule".to_string()),
+        ),
+        (
+            "OPENAI_IDENTITY_TOKEN_FILE".to_string(),
+            Some("/run/identity-token".to_string()),
         ),
     ]);
     let spawn_request_id = mcp
@@ -93,12 +102,40 @@ async fn process_spawn_returns_before_exit_and_emits_exit_notification() -> Resu
         ProcessExitedNotification {
             process_handle,
             exit_code: 0,
-            stdout: "process-out".to_string(),
+            stdout: "process-out||".to_string(),
             stdout_cap_reached: false,
             stderr: "process-err".to_string(),
             stderr_cap_reached: false,
         }
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn process_spawn_returns_error_when_local_environment_is_disabled() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+    create_config_toml(codex_home.path(), &server.uri(), "never")?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .with_env_overrides(&[(CODEX_EXEC_SERVER_URL_ENV_VAR, Some("none"))])
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let process_request_id = mcp
+        .send_process_spawn_request(process_spawn_params(
+            "disabled-process".to_string(),
+            codex_home.path(),
+            vec!["sh".to_string(), "-lc".to_string(), "true".to_string()],
+        )?)
+        .await?;
+    let error = mcp
+        .read_stream_until_error_message(RequestId::Integer(process_request_id))
+        .await?;
+    assert_eq!(error.error.message, "local environment is not configured");
+
     Ok(())
 }
 
@@ -202,10 +239,14 @@ async fn process_kill_terminates_running_process() -> Result<()> {
     Ok(())
 }
 
-async fn initialized_mcp(codex_home: &Path) -> Result<(MockServer, McpProcess)> {
+async fn initialized_mcp(codex_home: &Path) -> Result<(MockServer, TestAppServer)> {
     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
     create_config_toml(codex_home, &server.uri(), "never")?;
-    let mut mcp = McpProcess::new(codex_home).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home)
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
     Ok((server, mcp))
 }
@@ -229,7 +270,7 @@ fn process_spawn_params(
     })
 }
 
-async fn read_process_exited(mcp: &mut McpProcess) -> Result<ProcessExitedNotification> {
+async fn read_process_exited(mcp: &mut TestAppServer) -> Result<ProcessExitedNotification> {
     let notification = mcp
         .read_stream_until_notification_message("process/exited")
         .await?;

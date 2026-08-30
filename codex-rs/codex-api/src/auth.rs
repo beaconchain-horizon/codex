@@ -1,7 +1,8 @@
-use async_trait::async_trait;
 use codex_client::Request;
 use codex_client::TransportError;
 use http::HeaderMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 /// Error returned while applying authentication to an outbound request.
@@ -26,7 +27,6 @@ impl From<AuthError> for TransportError {
 ///
 /// Header-only providers can implement `add_auth_headers`; providers that sign
 /// complete requests can override `apply_auth`.
-#[async_trait]
 pub trait AuthProvider: Send + Sync {
     /// Adds any auth headers that are available without request body access.
     ///
@@ -41,6 +41,15 @@ pub trait AuthProvider: Send + Sync {
         headers
     }
 
+    /// Resolves auth headers for an outbound request.
+    ///
+    /// Unlike [`Self::to_auth_headers`], implementations may perform asynchronous work to refresh
+    /// credentials before returning. Header-only providers with static credentials can rely on the
+    /// default implementation.
+    fn resolve_auth_headers(&self) -> AuthHeadersFuture<'_> {
+        Box::pin(async { Ok(self.to_auth_headers()) })
+    }
+
     /// Applies auth to a complete outbound request and returns the request to send.
     ///
     /// The input `request` is moved into this method. Implementations may mutate
@@ -52,15 +61,29 @@ pub trait AuthProvider: Send + Sync {
     ///
     /// Callers must always use the returned request as authoritative.
     /// If this returns [`AuthError`], the request should not be sent.
-    async fn apply_auth(&self, request: Request) -> Result<Request, AuthError> {
-        let mut request = request;
-        self.add_auth_headers(&mut request.headers);
-        Ok(request)
+    fn apply_auth(&self, request: Request) -> AuthProviderFuture<'_> {
+        Box::pin(async move {
+            let mut request = request;
+            request.headers.extend(self.resolve_auth_headers().await?);
+            Ok(request)
+        })
     }
 }
 
+pub type AuthProviderFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Request, AuthError>> + Send + 'a>>;
+
+pub type AuthHeadersFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<HeaderMap, AuthError>> + Send + 'a>>;
+
 /// Shared auth handle passed through API clients.
 pub type SharedAuthProvider = Arc<dyn AuthProvider>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentIdentityTelemetry {
+    pub agent_id: String,
+    pub task_id: String,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AuthHeaderTelemetry {

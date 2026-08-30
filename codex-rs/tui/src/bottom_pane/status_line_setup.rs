@@ -11,11 +11,12 @@
 //!
 //! - Model information (name, reasoning level)
 //! - Directory paths (current dir, project root)
+//! - Machine hostname
 //! - Git information (branch name)
 //! - Permissions profile
 //! - Approval mode
 //! - Context usage (remaining %, used %, window size)
-//! - Usage limits (5-hour, weekly)
+//! - Usage limits (primary, secondary)
 //! - Session info (thread title, thread ID, tokens used)
 //! - Application version
 
@@ -35,6 +36,7 @@ use crate::bottom_pane::multi_select_picker::MultiSelectItem;
 use crate::bottom_pane::multi_select_picker::MultiSelectPicker;
 use crate::bottom_pane::status_surface_preview::StatusSurfacePreviewData;
 use crate::bottom_pane::status_surface_preview::StatusSurfacePreviewItem;
+use crate::keymap::ListKeymap;
 use crate::render::renderable::Renderable;
 
 const STATUS_LINE_USE_THEME_COLORS_ITEM_ID: &str = "status-line-use-theme-colors";
@@ -59,6 +61,9 @@ pub(crate) enum StatusLineItem {
     /// Model name with reasoning level suffix.
     ModelWithReasoning,
 
+    /// Current reasoning level.
+    Reasoning,
+
     /// Current working directory path.
     CurrentDir,
 
@@ -69,6 +74,9 @@ pub(crate) enum StatusLineItem {
         serialize = "project-root"
     )]
     ProjectRoot,
+
+    /// Hostname of the machine running Codex.
+    Hostname,
 
     /// Current git branch name (if in a repository).
     GitBranch,
@@ -99,10 +107,10 @@ pub(crate) enum StatusLineItem {
     #[strum(to_string = "context-used", serialize = "context-usage")]
     ContextUsed,
 
-    /// Remaining usage on the 5-hour rate limit.
+    /// Remaining usage on the primary rate limit.
     FiveHourLimit,
 
-    /// Remaining usage on the weekly rate limit.
+    /// Remaining usage on the secondary rate limit.
     WeeklyLimit,
 
     /// Codex application version.
@@ -120,6 +128,12 @@ pub(crate) enum StatusLineItem {
     /// Total output tokens generated.
     TotalOutputTokens,
 
+    /// Estimated credits attributed directly to the current enterprise thread.
+    ThreadCredits,
+
+    /// Estimated dollar cost attributed directly to the current enterprise thread.
+    EstimatedThreadCost,
+
     /// Full thread UUID.
     #[strum(to_string = "thread-id", serialize = "session-id")]
     SessionId,
@@ -133,6 +147,9 @@ pub(crate) enum StatusLineItem {
     /// Current thread title (if set by user).
     ThreadTitle,
 
+    /// Current workspace notification headline.
+    WorkspaceHeadline,
+
     /// Latest checklist task progress from `update_plan` (if available).
     TaskProgress,
 }
@@ -143,8 +160,10 @@ impl StatusLineItem {
         match self {
             StatusLineItem::ModelName => "Current model name",
             StatusLineItem::ModelWithReasoning => "Current model name with reasoning level",
+            StatusLineItem::Reasoning => "Current reasoning level",
             StatusLineItem::CurrentDir => "Current working directory",
             StatusLineItem::ProjectRoot => "Project name (omitted when unavailable)",
+            StatusLineItem::Hostname => "Current machine hostname (omitted when unavailable)",
             StatusLineItem::GitBranch => "Current Git branch (omitted when unavailable)",
             StatusLineItem::PullRequestNumber => {
                 "Open pull request number for the current branch (omitted when unavailable)"
@@ -162,10 +181,10 @@ impl StatusLineItem {
                 "Percentage of context window used (omitted when unknown)"
             }
             StatusLineItem::FiveHourLimit => {
-                "Remaining usage on 5-hour usage limit (omitted when unavailable)"
+                "Remaining usage on the primary usage limit (omitted when unavailable)"
             }
             StatusLineItem::WeeklyLimit => {
-                "Remaining usage on weekly usage limit (omitted when unavailable)"
+                "Remaining usage on the secondary usage limit (omitted when unavailable)"
             }
             StatusLineItem::CodexVersion => "Codex application version",
             StatusLineItem::ContextWindowSize => {
@@ -174,11 +193,20 @@ impl StatusLineItem {
             StatusLineItem::UsedTokens => "Total tokens used in session (omitted when zero)",
             StatusLineItem::TotalInputTokens => "Total input tokens used in session",
             StatusLineItem::TotalOutputTokens => "Total output tokens used in session",
+            StatusLineItem::ThreadCredits => {
+                "Estimated current-thread credits (Enterprise workspaces only; omitted when unavailable)"
+            }
+            StatusLineItem::EstimatedThreadCost => {
+                "Estimated current-thread cost in USD (Enterprise workspaces only; omitted when unavailable)"
+            }
             StatusLineItem::SessionId => "Current thread identifier (omitted until thread starts)",
             StatusLineItem::FastMode => "Whether Fast mode is currently active",
             StatusLineItem::RawOutput => "Whether raw scrollback mode is active",
             StatusLineItem::ThreadTitle => {
                 "Current thread title, or thread identifier when unnamed"
+            }
+            StatusLineItem::WorkspaceHeadline => {
+                "Workspace notification headline (Enterprise workspaces only; omitted when unavailable)"
             }
             StatusLineItem::TaskProgress => {
                 "Latest task progress from update_plan (omitted until available)"
@@ -190,8 +218,10 @@ impl StatusLineItem {
         match self {
             StatusLineItem::ModelName => StatusSurfacePreviewItem::Model,
             StatusLineItem::ModelWithReasoning => StatusSurfacePreviewItem::ModelWithReasoning,
+            StatusLineItem::Reasoning => StatusSurfacePreviewItem::Reasoning,
             StatusLineItem::CurrentDir => StatusSurfacePreviewItem::CurrentDir,
             StatusLineItem::ProjectRoot => StatusSurfacePreviewItem::ProjectRoot,
+            StatusLineItem::Hostname => StatusSurfacePreviewItem::Hostname,
             StatusLineItem::GitBranch => StatusSurfacePreviewItem::GitBranch,
             StatusLineItem::PullRequestNumber => StatusSurfacePreviewItem::PullRequestNumber,
             StatusLineItem::BranchChanges => StatusSurfacePreviewItem::BranchChanges,
@@ -207,10 +237,13 @@ impl StatusLineItem {
             StatusLineItem::UsedTokens => StatusSurfacePreviewItem::UsedTokens,
             StatusLineItem::TotalInputTokens => StatusSurfacePreviewItem::TotalInputTokens,
             StatusLineItem::TotalOutputTokens => StatusSurfacePreviewItem::TotalOutputTokens,
+            StatusLineItem::ThreadCredits => StatusSurfacePreviewItem::ThreadCredits,
+            StatusLineItem::EstimatedThreadCost => StatusSurfacePreviewItem::EstimatedThreadCost,
             StatusLineItem::SessionId => StatusSurfacePreviewItem::SessionId,
             StatusLineItem::FastMode => StatusSurfacePreviewItem::FastMode,
             StatusLineItem::RawOutput => StatusSurfacePreviewItem::RawOutput,
             StatusLineItem::ThreadTitle => StatusSurfacePreviewItem::ThreadTitle,
+            StatusLineItem::WorkspaceHeadline => StatusSurfacePreviewItem::WorkspaceHeadline,
             StatusLineItem::TaskProgress => StatusSurfacePreviewItem::TaskProgress,
         }
     }
@@ -246,6 +279,7 @@ impl StatusLineSetupView {
         use_theme_colors: bool,
         preview_data: StatusSurfacePreviewData,
         app_event_tx: AppEventSender,
+        list_keymap: ListKeymap,
     ) -> Self {
         let mut used_ids = HashSet::new();
         let mut items = vec![MultiSelectItem {
@@ -266,7 +300,11 @@ impl StatusLineSetupView {
                 if !used_ids.insert(item_id.clone()) {
                     continue;
                 }
-                items.push(Self::status_line_select_item(item, /*enabled*/ true));
+                items.push(Self::status_line_select_item(
+                    item,
+                    /*enabled*/ true,
+                    &preview_data,
+                ));
             }
         }
 
@@ -275,7 +313,11 @@ impl StatusLineSetupView {
             if used_ids.contains(&item_id) {
                 continue;
             }
-            items.push(Self::status_line_select_item(item, /*enabled*/ false));
+            items.push(Self::status_line_select_item(
+                item,
+                /*enabled*/ false,
+                &preview_data,
+            ));
         }
 
         Self {
@@ -284,10 +326,7 @@ impl StatusLineSetupView {
                 Some("Select which items to display in the status line.".to_string()),
                 app_event_tx,
             )
-            .instructions(vec![
-                "Use ↑↓ to navigate, ←→ to move, space to select, enter to confirm, esc to cancel."
-                    .into(),
-            ])
+            .list_keymap(list_keymap)
             .items(items)
             .enable_ordering()
             .on_preview(move |items| {
@@ -325,11 +364,25 @@ impl StatusLineSetupView {
     }
 
     /// Converts a [`StatusLineItem`] into a [`MultiSelectItem`] for the picker.
-    fn status_line_select_item(item: StatusLineItem, enabled: bool) -> MultiSelectItem {
+    fn status_line_select_item(
+        item: StatusLineItem,
+        enabled: bool,
+        preview_data: &StatusSurfacePreviewData,
+    ) -> MultiSelectItem {
+        let default_name = item.to_string();
+        let default_description = item.description();
+        let (name, description) = match item {
+            StatusLineItem::FiveHourLimit | StatusLineItem::WeeklyLimit => (
+                preview_data.rate_limit_item_name(item.preview_item(), &default_name),
+                preview_data.rate_limit_item_description(item.preview_item(), default_description),
+            ),
+            _ => (default_name, default_description.to_string()),
+        };
+
         MultiSelectItem {
             id: item.to_string(),
-            name: item.to_string(),
-            description: Some(item.description().to_string()),
+            name,
+            description: Some(description),
             enabled,
             orderable: true,
             section_break_after: false,
@@ -338,6 +391,10 @@ impl StatusLineSetupView {
 }
 
 impl BottomPaneView for StatusLineSetupView {
+    fn keymap_contexts(&self) -> crate::keymap::KeymapContextSet {
+        crate::keymap::KeymapContextSet::new(crate::keymap::KeymapContext::List)
+    }
+
     fn handle_key_event(&mut self, key_event: crossterm::event::KeyEvent) {
         self.picker.handle_key_event(key_event);
     }
@@ -399,6 +456,19 @@ mod tests {
             "context-remaining"
         );
     }
+
+    #[test]
+    fn thread_usage_items_are_independently_selectable() {
+        assert_eq!(
+            "thread-credits".parse::<StatusLineItem>(),
+            Ok(StatusLineItem::ThreadCredits)
+        );
+        assert_eq!(
+            "estimated-thread-cost".parse::<StatusLineItem>(),
+            Ok(StatusLineItem::EstimatedThreadCost)
+        );
+    }
+
     #[test]
     fn project_name_is_canonical_and_accepts_legacy_ids() {
         assert_eq!(StatusLineItem::ProjectRoot.to_string(), "project-name");
@@ -426,6 +496,15 @@ mod tests {
         assert_eq!(
             "model-name".parse::<StatusLineItem>(),
             Ok(StatusLineItem::ModelName)
+        );
+    }
+
+    #[test]
+    fn reasoning_is_selectable_id() {
+        assert_eq!(StatusLineItem::Reasoning.to_string(), "reasoning");
+        assert_eq!(
+            "reasoning".parse::<StatusLineItem>(),
+            Ok(StatusLineItem::Reasoning)
         );
     }
 
@@ -617,13 +696,72 @@ mod tests {
                 ),
                 (
                     StatusLineItem::WeeklyLimit.preview_item(),
-                    "weekly 82%".to_string(),
+                    "weekly 82% left".to_string(),
                 ),
             ]),
             AppEventSender::new(tx_raw),
+            crate::keymap::RuntimeKeymap::defaults().list,
         );
 
         assert_snapshot!(render_lines(&view, /*width*/ 72));
+    }
+
+    #[test]
+    fn setup_view_snapshot_includes_thread_usage_items() {
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+        let view = StatusLineSetupView::new(
+            Some(&[
+                StatusLineItem::ThreadCredits.to_string(),
+                StatusLineItem::EstimatedThreadCost.to_string(),
+            ]),
+            /*use_theme_colors*/ true,
+            StatusSurfacePreviewData::from_iter([
+                (
+                    StatusLineItem::ThreadCredits.preview_item(),
+                    "5.2 credits".to_string(),
+                ),
+                (
+                    StatusLineItem::EstimatedThreadCost.preview_item(),
+                    "~$1.82".to_string(),
+                ),
+            ]),
+            AppEventSender::new(tx_raw),
+            crate::keymap::RuntimeKeymap::defaults().list,
+        );
+
+        assert_snapshot!(render_lines(&view, /*width*/ 100));
+    }
+
+    #[test]
+    fn setup_view_snapshot_includes_hostname() {
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+        let view = StatusLineSetupView::new(
+            Some(&[
+                StatusLineItem::Hostname.to_string(),
+                StatusLineItem::CurrentDir.to_string(),
+            ]),
+            /*use_theme_colors*/ true,
+            StatusSurfacePreviewData::from_iter([
+                (
+                    StatusLineItem::Hostname.preview_item(),
+                    "ssh-build-01.example.com".to_string(),
+                ),
+                (
+                    StatusLineItem::CurrentDir.preview_item(),
+                    "~/codex-rs".to_string(),
+                ),
+            ]),
+            AppEventSender::new(tx_raw),
+            crate::keymap::RuntimeKeymap::defaults().list,
+        );
+
+        assert_snapshot!(
+            render_lines(&view, /*width*/ 100)
+                .lines()
+                .map(str::trim_end)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
     }
 
     fn render_lines(view: &StatusLineSetupView, width: u16) -> String {

@@ -121,6 +121,7 @@ impl EventProcessorWithJsonOutput {
         Usage {
             input_tokens: usage.total.input_tokens,
             cached_input_tokens: usage.total.cached_input_tokens,
+            cache_write_input_tokens: usage.total.cache_write_input_tokens,
             output_tokens: usage.total.output_tokens,
             reasoning_output_tokens: usage.total.reasoning_output_tokens,
         }
@@ -223,6 +224,7 @@ impl EventProcessorWithJsonOutput {
                     arguments,
                     result: result.map(|result| McpToolCallItemResult {
                         content: result.content,
+                        meta: result.meta,
                         structured_content: result.structured_content,
                     }),
                     error: error.map(|error| McpToolCallItemError {
@@ -242,6 +244,10 @@ impl EventProcessorWithJsonOutput {
                 id: make_id(),
                 details: ThreadItemDetails::CollabToolCall(CollabToolCallItem {
                     tool: match tool {
+                        CollabAgentTool::SendMessage
+                        | CollabAgentTool::FollowupTask
+                        | CollabAgentTool::InterruptAgent
+                        | CollabAgentTool::ListAgents => return None,
                         CollabAgentTool::SpawnAgent => CollabTool::SpawnAgent,
                         CollabAgentTool::SendInput => CollabTool::SendInput,
                         CollabAgentTool::ResumeAgent => CollabTool::Wait,
@@ -289,19 +295,16 @@ impl EventProcessorWithJsonOutput {
                         CollabAgentToolCallStatus::InProgress => CollabToolCallStatus::InProgress,
                         CollabAgentToolCallStatus::Completed => CollabToolCallStatus::Completed,
                         CollabAgentToolCallStatus::Failed => CollabToolCallStatus::Failed,
+                        CollabAgentToolCallStatus::Interrupted => return None,
                     },
                 }),
             }),
-            ThreadItem::WebSearch {
-                id: raw_id,
-                query,
-                action,
-            } => Some(ExecThreadItem {
+            ThreadItem::WebSearch(item) => Some(ExecThreadItem {
                 id: make_id(),
                 details: ThreadItemDetails::WebSearch(WebSearchItem {
-                    id: raw_id,
-                    query,
-                    action: match action {
+                    id: item.id,
+                    query: item.query,
+                    action: match item.action {
                         Some(action) => serde_json::from_value(
                             serde_json::to_value(action).unwrap_or_else(|_| json!("other")),
                         )
@@ -428,6 +431,11 @@ impl EventProcessorWithJsonOutput {
                     },
                 }));
                 CodexStatus::Running
+            }
+            ServerNotification::Warning(notification) => {
+                let warning = self.collect_warning(notification.message);
+                events.extend(warning.events);
+                warning.status
             }
             ServerNotification::Error(notification) => {
                 let message = match notification.error.additional_details {

@@ -5,6 +5,10 @@ use std::time::Duration;
 use codex_analytics::CompactionTrigger;
 use codex_analytics::HookRunFact;
 use codex_analytics::build_track_events_context;
+use codex_connectors::AppToolPolicyEvaluator;
+use codex_connectors::AppToolPolicyInput;
+use codex_core_plugins::executor_plugin_hook_sources;
+use codex_hooks::InterruptRequest;
 use codex_hooks::PermissionRequestDecision;
 use codex_hooks::PermissionRequestOutcome;
 use codex_hooks::PermissionRequestRequest;
@@ -13,51 +17,66 @@ use codex_hooks::PostToolUseRequest;
 use codex_hooks::PreToolUseOutcome;
 use codex_hooks::PreToolUseRequest;
 use codex_hooks::SessionStartOutcome;
+use codex_hooks::StartHookTarget;
+use codex_hooks::StopHookTarget;
+use codex_hooks::StopOutcome;
+use codex_hooks::SubagentHookContext;
 use codex_hooks::UserPromptSubmitOutcome;
 use codex_hooks::UserPromptSubmitRequest;
+use codex_hooks::hook_execution_mode_label;
+use codex_hooks::hook_handler_type_label;
+use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_otel::HOOK_RUN_DURATION_METRIC;
 use codex_otel::HOOK_RUN_METRIC;
+use codex_plugin::ExecutorPluginHookSource;
+use codex_protocol::items::FunctionCallOutputItem;
 use codex_protocol::items::TurnItem;
-use codex_protocol::models::ResponseInputItem;
+use codex_protocol::items::UserMessageItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::HookCompletedEvent;
 use codex_protocol::protocol::HookEventName;
+use codex_protocol::protocol::HookExecutionMode;
+use codex_protocol::protocol::HookHandlerType;
+use codex_protocol::protocol::HookOutputEntryKind;
 use codex_protocol::protocol::HookRunStatus;
 use codex_protocol::protocol::HookRunSummary;
 use codex_protocol::protocol::HookSource;
 use codex_protocol::protocol::HookStartedEvent;
-use codex_protocol::user_input::UserInput;
+use codex_protocol::protocol::InternalSessionSource;
+use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::SubAgentSource;
+use codex_protocol::protocol::WarningEvent;
+use codex_rollout::state_db;
+use codex_thread_store::PersistContext;
+use codex_thread_store::ReadThreadParams;
+use serde_json::Map;
 use serde_json::Value;
+use tokio::sync::Mutex;
+use tracing::instrument;
 
 use crate::context::ContextualUserFragment;
 use crate::context::HookAdditionalContext;
 use crate::event_mapping::parse_turn_item;
+use crate::session::TurnInput;
 use crate::session::session::Session;
+use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
+use crate::state::TurnState;
 use crate::tools::hook_names::HookToolName;
 use crate::tools::sandboxing::PermissionRequestPayload;
+use crate::turn_metadata::McpTurnMetadataContext;
 
 pub(crate) struct HookRuntimeOutcome {
     pub should_stop: bool,
     pub additional_contexts: Vec<String>,
 }
 
-pub(crate) enum PendingInputHookDisposition {
-    Accepted(Box<PendingInputRecord>),
-    Blocked { additional_contexts: Vec<String> },
-}
-
-pub(crate) enum PendingInputRecord {
-    UserMessage {
-        content: Vec<UserInput>,
-        response_item: ResponseItem,
-        additional_contexts: Vec<String>,
-    },
-    ConversationItem {
-        response_item: ResponseItem,
-    },
+pub(crate) enum PreToolUseHookResult {
+    Continue { updated_input: Option<Value> },
+    Blocked(String),
 }
 
 struct ContextInjectingHookOutcome {
@@ -101,33 +120,60 @@ impl From<UserPromptSubmitOutcome> for ContextInjectingHookOutcome {
     }
 }
 
+#[instrument(level = "trace", skip_all)]
 pub(crate) async fn run_pending_session_start_hooks(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
 ) -> bool {
-    let Some(session_start_source) = sess.take_pending_session_start_source().await else {
-        return false;
-    };
+    while let Some(session_start_source) = sess.take_pending_session_start_source().await {
+        // Pending session-start hooks are reused to dispatch thread-spawn subagent
+        // starts. Other subagent sessions are internal/system work and do not run
+        // start hooks.
+        let target = match &turn_context.session_source {
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn { agent_role, .. })
+                if matches!(
+                    session_start_source,
+                    codex_hooks::SessionStartSource::Startup
+                ) =>
+            {
+                let context = subagent_hook_context(sess, agent_role);
+                StartHookTarget::SubagentStart {
+                    turn_id: turn_context.sub_id.clone(),
+                    agent_id: context.agent_id,
+                    agent_type: context.agent_type,
+                }
+            }
+            SessionSource::SubAgent(_) => return false,
+            _ => StartHookTarget::SessionStart {
+                source: session_start_source,
+            },
+        };
+        let request = codex_hooks::SessionStartRequest {
+            session_id: sess.session_id().into(),
+            #[allow(deprecated)]
+            cwd: turn_context.cwd.clone(),
+            transcript_path: sess.hook_transcript_path().await,
+            model: turn_context.model_info().slug.clone(),
+            permission_mode: hook_permission_mode(turn_context),
+            target,
+        };
+        let hooks = sess.hooks();
+        let preview_runs = hooks.preview_session_start(&request);
+        if run_context_injecting_hook(
+            sess,
+            turn_context,
+            preview_runs,
+            hooks.run_session_start(request, Some(turn_context.sub_id.clone())),
+        )
+        .await
+        .record_additional_contexts(sess, turn_context)
+        .await
+        {
+            return true;
+        }
+    }
 
-    let request = codex_hooks::SessionStartRequest {
-        session_id: sess.conversation_id,
-        cwd: turn_context.cwd.clone(),
-        transcript_path: sess.hook_transcript_path().await,
-        model: turn_context.model_info.slug.clone(),
-        permission_mode: hook_permission_mode(turn_context),
-        source: session_start_source,
-    };
-    let hooks = sess.hooks();
-    let preview_runs = hooks.preview_session_start(&request);
-    run_context_injecting_hook(
-        sess,
-        turn_context,
-        preview_runs,
-        hooks.run_session_start(request, Some(turn_context.sub_id.clone())),
-    )
-    .await
-    .record_additional_contexts(sess, turn_context)
-    .await
+    false
 }
 
 /// Runs matching `PreToolUse` hooks before a tool executes.
@@ -141,13 +187,15 @@ pub(crate) async fn run_pre_tool_use_hooks(
     tool_use_id: String,
     tool_name: &HookToolName,
     tool_input: &Value,
-) -> Option<String> {
+) -> PreToolUseHookResult {
     let request = PreToolUseRequest {
-        session_id: sess.conversation_id,
+        session_id: sess.session_id().into(),
         turn_id: turn_context.sub_id.clone(),
+        subagent: thread_spawn_subagent_hook_context(sess, turn_context),
+        #[allow(deprecated)]
         cwd: turn_context.cwd.clone(),
         transcript_path: sess.hook_transcript_path().await,
-        model: turn_context.model_info.slug.clone(),
+        model: turn_context.model_info().slug.clone(),
         permission_mode: hook_permission_mode(turn_context),
         tool_name: tool_name.name().to_string(),
         matcher_aliases: tool_name.matcher_aliases().to_vec(),
@@ -163,25 +211,32 @@ pub(crate) async fn run_pre_tool_use_hooks(
         should_block,
         block_reason,
         additional_contexts,
+        updated_input,
     } = hooks.run_pre_tool_use(request).await;
     emit_hook_completed_events(sess, turn_context, hook_events).await;
     record_additional_contexts(sess, turn_context, additional_contexts).await;
 
-    if should_block {
-        block_reason.map(|reason| {
-            if (tool_name.name() == "Bash" || tool_name.name() == "apply_patch")
-                && let Some(command) = tool_input.get("command").and_then(Value::as_str)
-            {
-                format!("Command blocked by PreToolUse hook: {reason}. Command: {command}")
-            } else {
-                format!(
-                    "Tool call blocked by PreToolUse hook: {reason}. Tool: {}",
-                    tool_name.name()
-                )
-            }
-        })
+    if !should_block {
+        return PreToolUseHookResult::Continue { updated_input };
+    }
+
+    let Some(reason) = block_reason else {
+        return PreToolUseHookResult::Continue {
+            updated_input: None,
+        };
+    };
+
+    if (tool_name.name() == "Bash" || tool_name.name() == "apply_patch")
+        && let Some(command) = tool_input.get("command").and_then(Value::as_str)
+    {
+        PreToolUseHookResult::Blocked(format!(
+            "Command blocked by PreToolUse hook: {reason}. Command: {command}"
+        ))
     } else {
-        None
+        PreToolUseHookResult::Blocked(format!(
+            "Tool call blocked by PreToolUse hook: {reason}. Tool: {}",
+            tool_name.name()
+        ))
     }
 }
 
@@ -195,11 +250,13 @@ pub(crate) async fn run_permission_request_hooks(
     payload: PermissionRequestPayload,
 ) -> Option<PermissionRequestDecision> {
     let request = PermissionRequestRequest {
-        session_id: sess.conversation_id,
+        session_id: sess.session_id().into(),
         turn_id: turn_context.sub_id.clone(),
+        subagent: thread_spawn_subagent_hook_context(sess, turn_context),
+        #[allow(deprecated)]
         cwd: turn_context.cwd.to_path_buf(),
         transcript_path: sess.hook_transcript_path().await,
-        model: turn_context.model_info.slug.clone(),
+        model: turn_context.model_info().slug.clone(),
         permission_mode: hook_permission_mode(turn_context),
         tool_name: payload.tool_name.name().to_string(),
         matcher_aliases: payload.tool_name.matcher_aliases().to_vec(),
@@ -235,11 +292,13 @@ pub(crate) async fn run_post_tool_use_hooks(
     tool_response: Value,
 ) -> PostToolUseOutcome {
     let request = PostToolUseRequest {
-        session_id: sess.conversation_id,
+        session_id: sess.session_id().into(),
         turn_id: turn_context.sub_id.clone(),
+        subagent: thread_spawn_subagent_hook_context(sess, turn_context),
+        #[allow(deprecated)]
         cwd: turn_context.cwd.clone(),
         transcript_path: sess.hook_transcript_path().await,
-        model: turn_context.model_info.slug.clone(),
+        model: turn_context.model_info().slug.clone(),
         permission_mode: hook_permission_mode(turn_context),
         tool_name,
         matcher_aliases,
@@ -256,17 +315,228 @@ pub(crate) async fn run_post_tool_use_hooks(
     outcome
 }
 
+fn executor_hook_sources_for_step(step_context: &StepContext) -> Vec<ExecutorPluginHookSource> {
+    step_context
+        .executor_capability_discovery
+        .as_deref()
+        .map(|snapshot| {
+            let app_tool_policy =
+                AppToolPolicyEvaluator::new(&step_context.mcp.config().config_layer_stack);
+            executor_plugin_hook_sources(snapshot, |server, tool| {
+                step_context
+                    .mcp
+                    .tool_info(server, tool)
+                    .filter(|tool_info| {
+                        if server != CODEX_APPS_MCP_SERVER_NAME {
+                            return true;
+                        }
+                        let annotations = tool_info.tool.annotations.as_ref();
+                        app_tool_policy
+                            .policy(AppToolPolicyInput {
+                                connector_id: tool_info.connector_id.as_deref(),
+                                tool_name: &tool_info.tool.name,
+                                tool_title: tool_info.tool.title.as_deref(),
+                                destructive_hint: annotations
+                                    .and_then(|annotations| annotations.destructive_hint),
+                                open_world_hint: annotations
+                                    .and_then(|annotations| annotations.open_world_hint),
+                            })
+                            .enabled
+                    })
+            })
+        })
+        .unwrap_or_default()
+}
+
+fn build_request_metadata(
+    step_context: Option<&StepContext>,
+    turn_context: &TurnContext,
+) -> Map<String, Value> {
+    let settings = step_context
+        .map(|step_context| step_context.settings.as_ref())
+        .unwrap_or(turn_context.initial_settings.as_ref());
+    turn_context
+        .turn_metadata_state
+        .current_meta_value_for_mcp_request(McpTurnMetadataContext {
+            model: settings.model_info.slug.as_str(),
+            reasoning_effort: settings.effective_reasoning_effort(),
+            node_repl_disabled: settings.model_info.node_repl_disabled,
+        })
+        .map(|turn_metadata| {
+            Map::from_iter([(
+                crate::X_CODEX_TURN_METADATA_HEADER.to_string(),
+                turn_metadata,
+            )])
+        })
+        .unwrap_or_default()
+}
+
+#[instrument(level = "trace", skip_all)]
+pub(crate) async fn run_turn_stop_hooks(
+    sess: &Arc<Session>,
+    step_context: &Arc<StepContext>,
+    stop_hook_active: bool,
+    last_assistant_message: Option<String>,
+) -> StopOutcome {
+    let turn_context = &step_context.turn;
+    // Resolve the stop hook kind from the session source before building the
+    // request. Root turns run Stop; thread-spawned child turns run SubagentStop.
+    let (target, transcript_path) = match &turn_context.session_source {
+        SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            agent_role,
+            parent_thread_id,
+            ..
+        }) => {
+            let context = subagent_hook_context(sess, agent_role);
+            let agent_transcript_path = sess.hook_transcript_path().await;
+            let parent_transcript_path = match sess
+                .services
+                .thread_store
+                .read_thread(ReadThreadParams {
+                    thread_id: *parent_thread_id,
+                    include_archived: true,
+                    include_history: false,
+                })
+                .await
+            {
+                Ok(thread) => thread.rollout_path,
+                Err(error) => {
+                    tracing::warn!(
+                        parent_thread_id = %parent_thread_id,
+                        error = %error,
+                        "failed to resolve parent transcript path for subagent hook"
+                    );
+                    None
+                }
+            };
+            (
+                StopHookTarget::SubagentStop {
+                    agent_id: context.agent_id,
+                    agent_type: context.agent_type,
+                    agent_transcript_path,
+                },
+                parent_transcript_path,
+            )
+        }
+        // Internal/synthetic subagents do not expose user-configured lifecycle
+        // hooks, so there is no Stop or SubagentStop request to dispatch.
+        SessionSource::SubAgent(_) => return StopOutcome::default(),
+        SessionSource::Internal(InternalSessionSource::MemoryConsolidation) => (
+            StopHookTarget::MemoryConsolidation,
+            sess.hook_transcript_path().await,
+        ),
+        _ => (StopHookTarget::Stop, sess.hook_transcript_path().await),
+    };
+    let request_metadata = build_request_metadata(Some(step_context), turn_context);
+    let request = codex_hooks::StopRequest {
+        session_id: sess.session_id().into(),
+        turn_id: turn_context.sub_id.clone(),
+        #[allow(deprecated)]
+        cwd: turn_context.cwd.clone(),
+        transcript_path,
+        model: turn_context.model_info().slug.clone(),
+        permission_mode: hook_permission_mode(turn_context),
+        request_metadata: (!request_metadata.is_empty()).then_some(request_metadata),
+        stop_hook_active,
+        last_assistant_message,
+        target,
+    };
+    let executor_hook_sources = executor_hook_sources_for_step(step_context);
+    let hooks = sess.hooks().with_executor_hooks(executor_hook_sources);
+    emit_hook_started_events(sess, turn_context, hooks.preview_stop(&request)).await;
+
+    let mut outcome = hooks.run_stop(request).await;
+    emit_hook_completed_events(sess, turn_context, std::mem::take(&mut outcome.hook_events)).await;
+    outcome
+}
+
+#[instrument(level = "trace", skip_all)]
+pub(crate) async fn run_session_end_hooks(sess: &Arc<Session>) {
+    let hooks = sess.hooks();
+    let preview_runs = hooks.preview_session_end();
+    if preview_runs.is_empty() {
+        return;
+    }
+
+    let turn_context = sess.new_default_turn().await;
+
+    // SessionEnd is root-only; ThreadSpawn uses SubagentStart/SubagentStop and other subagents
+    // are internal implementation details.
+    if matches!(&turn_context.session_source, SessionSource::SubAgent(_)) {
+        return;
+    }
+
+    let request = codex_hooks::SessionEndRequest {
+        session_id: sess.session_id().into(),
+        turn_id: turn_context.sub_id.clone(),
+        #[allow(deprecated)]
+        cwd: turn_context.cwd.clone(),
+        transcript_path: sess.hook_transcript_path().await,
+    };
+    if let Err(err) = sess.flush_rollout().await {
+        tracing::warn!("failed to flush transcript before SessionEnd hook: {err}");
+    }
+    emit_hook_started_events(sess, &turn_context, preview_runs).await;
+
+    let outcome = hooks.run_session_end(request).await;
+    emit_hook_completed_events(sess, &turn_context, outcome.hook_events).await;
+}
+
+pub(crate) async fn run_turn_interrupt_hooks(
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
+    turn_state: &Mutex<TurnState>,
+) {
+    if matches!(&turn_context.session_source, SessionSource::SubAgent(_)) {
+        return;
+    }
+
+    // The active turn has already been detached. Reuse only its last executing step's discovery.
+    let last_known_step_context = turn_state.lock().await.last_known_step_context.clone();
+    let executor_hook_sources = last_known_step_context
+        .as_deref()
+        .map(executor_hook_sources_for_step)
+        .unwrap_or_default();
+    let has_executor_hooks = !executor_hook_sources.is_empty();
+    let hooks = sess.hooks().with_executor_hooks(executor_hook_sources);
+    let preview_runs = hooks.preview_interrupt();
+    if preview_runs.is_empty() && !has_executor_hooks {
+        return;
+    }
+
+    let request_metadata = build_request_metadata(last_known_step_context.as_deref(), turn_context);
+    let request = InterruptRequest {
+        session_id: sess.session_id().into(),
+        turn_id: turn_context.sub_id.clone(),
+        #[allow(deprecated)]
+        cwd: turn_context.cwd.clone(),
+        transcript_path: sess.hook_transcript_path().await,
+        model: turn_context.model_info().slug.clone(),
+        permission_mode: hook_permission_mode(turn_context),
+        request_metadata: (!request_metadata.is_empty()).then_some(request_metadata),
+    };
+    if let Err(err) = sess.flush_rollout().await {
+        tracing::warn!("failed to flush transcript before Interrupt hook: {err}");
+    }
+    emit_hook_started_events(sess, turn_context, preview_runs).await;
+
+    let outcome = hooks.run_interrupt(request).await;
+    emit_hook_completed_events(sess, turn_context, outcome.hook_events).await;
+}
+
 pub(crate) async fn run_pre_compact_hooks(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
     trigger: CompactionTrigger,
 ) -> PreCompactHookOutcome {
     let request = codex_hooks::PreCompactRequest {
-        session_id: sess.conversation_id,
+        session_id: sess.session_id().into(),
         turn_id: turn_context.sub_id.clone(),
+        subagent: thread_spawn_subagent_hook_context(sess, turn_context),
+        #[allow(deprecated)]
         cwd: turn_context.cwd.clone(),
         transcript_path: sess.hook_transcript_path().await,
-        model: turn_context.model_info.slug.clone(),
+        model: turn_context.model_info().slug.clone(),
         trigger: compaction_trigger_label(trigger).to_string(),
     };
     let preview_runs = sess.hooks().preview_pre_compact(&request);
@@ -275,9 +545,7 @@ pub(crate) async fn run_pre_compact_hooks(
     let outcome = sess.hooks().run_pre_compact(request).await;
     emit_hook_completed_events(sess, turn_context, outcome.hook_events).await;
     if outcome.should_stop {
-        PreCompactHookOutcome::Stopped {
-            reason: outcome.stop_reason,
-        }
+        PreCompactHookOutcome::Stopped
     } else {
         PreCompactHookOutcome::Continue
     }
@@ -285,7 +553,7 @@ pub(crate) async fn run_pre_compact_hooks(
 
 pub(crate) enum PreCompactHookOutcome {
     Continue,
-    Stopped { reason: Option<String> },
+    Stopped,
 }
 
 pub(crate) enum PostCompactHookOutcome {
@@ -299,11 +567,13 @@ pub(crate) async fn run_post_compact_hooks(
     trigger: CompactionTrigger,
 ) -> PostCompactHookOutcome {
     let request = codex_hooks::PostCompactRequest {
-        session_id: sess.conversation_id,
+        session_id: sess.session_id().into(),
         turn_id: turn_context.sub_id.clone(),
+        subagent: thread_spawn_subagent_hook_context(sess, turn_context),
+        #[allow(deprecated)]
         cwd: turn_context.cwd.clone(),
         transcript_path: sess.hook_transcript_path().await,
-        model: turn_context.model_info.slug.clone(),
+        model: turn_context.model_info().slug.clone(),
         trigger: compaction_trigger_label(trigger).to_string(),
     };
     let preview_runs = sess.hooks().preview_post_compact(&request);
@@ -318,81 +588,218 @@ pub(crate) async fn run_post_compact_hooks(
     }
 }
 
-pub(crate) async fn run_user_prompt_submit_hooks(
+#[instrument(level = "trace", skip_all)]
+pub(crate) async fn run_legacy_after_agent_hook(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
-    prompt: String,
-) -> HookRuntimeOutcome {
-    let request = UserPromptSubmitRequest {
-        session_id: sess.conversation_id,
-        turn_id: turn_context.sub_id.clone(),
-        cwd: turn_context.cwd.clone(),
-        transcript_path: sess.hook_transcript_path().await,
-        model: turn_context.model_info.slug.clone(),
-        permission_mode: hook_permission_mode(turn_context),
-        prompt,
-    };
+    input: &[ResponseItem],
+    last_assistant_message: Option<String>,
+) -> bool {
+    let mut abort_message = None;
+    let input_messages = input
+        .iter()
+        .filter_map(|item| match parse_turn_item(item) {
+            Some(TurnItem::UserMessage(user_message)) => Some(user_message.message()),
+            _ => None,
+        })
+        .collect();
     let hooks = sess.hooks();
-    let preview_runs = hooks.preview_user_prompt_submit(&request);
-    run_context_injecting_hook(
-        sess,
-        turn_context,
-        preview_runs,
-        hooks.run_user_prompt_submit(request),
-    )
-    .await
+    for hook_outcome in hooks
+        .dispatch(codex_hooks::HookPayload {
+            session_id: sess.session_id().into(),
+            #[allow(deprecated)]
+            cwd: turn_context.cwd.clone(),
+            client: turn_context.app_server_client_name.clone(),
+            triggered_at: chrono::Utc::now(),
+            hook_event: codex_hooks::HookEvent::AfterAgent {
+                event: codex_hooks::HookEventAfterAgent {
+                    thread_id: sess.thread_id,
+                    turn_id: turn_context.sub_id.clone(),
+                    input_messages,
+                    last_assistant_message,
+                },
+            },
+        })
+        .await
+    {
+        let hook_name = hook_outcome.hook_name;
+        let (error, should_abort) = match hook_outcome.result {
+            codex_hooks::HookResult::Success => continue,
+            codex_hooks::HookResult::FailedContinue(error) => (error, false),
+            codex_hooks::HookResult::FailedAbort(error) => (error, true),
+        };
+        let action = if should_abort {
+            "aborting operation"
+        } else {
+            "continuing"
+        };
+        tracing::warn!(
+            turn_id = %turn_context.sub_id,
+            hook_name = %hook_name,
+            error = %error,
+            "after_agent hook failed; {action}"
+        );
+        if should_abort && abort_message.is_none() {
+            abort_message = Some(format!(
+                "after_agent hook '{hook_name}' failed and aborted turn completion: {error}"
+            ));
+        }
+    }
+    let Some(message) = abort_message else {
+        return false;
+    };
+    let event = EventMsg::Error(codex_protocol::protocol::ErrorEvent {
+        misalignment: None,
+        message,
+        codex_error_info: Some(CodexErrorInfo::Other),
+    });
+    sess.send_event(turn_context, event).await;
+    true
 }
 
 pub(crate) async fn inspect_pending_input(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
-    pending_input_item: ResponseInputItem,
-) -> PendingInputHookDisposition {
-    let response_item = ResponseItem::from(pending_input_item);
-    if let Some(TurnItem::UserMessage(user_message)) = parse_turn_item(&response_item) {
-        let user_prompt_submit_outcome =
-            run_user_prompt_submit_hooks(sess, turn_context, user_message.message()).await;
-        if user_prompt_submit_outcome.should_stop {
-            PendingInputHookDisposition::Blocked {
-                additional_contexts: user_prompt_submit_outcome.additional_contexts,
-            }
-        } else {
-            PendingInputHookDisposition::Accepted(Box::new(PendingInputRecord::UserMessage {
-                content: user_message.content,
-                response_item,
-                additional_contexts: user_prompt_submit_outcome.additional_contexts,
-            }))
+    pending_input_item: &TurnInput,
+) -> HookRuntimeOutcome {
+    match pending_input_item {
+        TurnInput::UserInput { content, .. } => {
+            let request = UserPromptSubmitRequest {
+                session_id: sess.session_id().into(),
+                turn_id: turn_context.sub_id.clone(),
+                subagent: thread_spawn_subagent_hook_context(sess, turn_context),
+                #[allow(deprecated)]
+                cwd: turn_context.cwd.clone(),
+                transcript_path: sess.hook_transcript_path().await,
+                model: turn_context.model_info().slug.clone(),
+                permission_mode: hook_permission_mode(turn_context),
+                prompt: UserMessageItem::new(content).message(),
+            };
+            let hooks = sess.hooks();
+            let preview_runs = hooks.preview_user_prompt_submit(&request);
+            run_context_injecting_hook(
+                sess,
+                turn_context,
+                preview_runs,
+                hooks.run_user_prompt_submit(request),
+            )
+            .await
         }
-    } else {
-        PendingInputHookDisposition::Accepted(Box::new(PendingInputRecord::ConversationItem {
-            response_item,
-        }))
+        TurnInput::ResponseItem(_) | TurnInput::FunctionCallOutput(_) => HookRuntimeOutcome {
+            should_stop: false,
+            additional_contexts: Vec::new(),
+        },
+        TurnInput::InterAgentCommunication(_) => HookRuntimeOutcome {
+            should_stop: false,
+            additional_contexts: Vec::new(),
+        },
     }
 }
 
 pub(crate) async fn record_pending_input(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
-    pending_input: PendingInputRecord,
+    pending_input: TurnInput,
+    additional_contexts: Vec<String>,
+    persist_context: PersistContext,
 ) {
     match pending_input {
-        PendingInputRecord::UserMessage {
-            content,
-            response_item,
-            additional_contexts,
-        } => {
+        TurnInput::UserInput { content, client_id } => {
             sess.record_user_prompt_and_emit_turn_item(
                 turn_context.as_ref(),
                 content.as_slice(),
-                response_item,
+                client_id,
+                persist_context,
             )
             .await;
-            record_additional_contexts(sess, turn_context, additional_contexts).await;
         }
-        PendingInputRecord::ConversationItem { response_item } => {
-            sess.record_conversation_items(turn_context, std::slice::from_ref(&response_item))
+        TurnInput::ResponseItem(item) => {
+            sess.record_annotated_conversation_items(turn_context, vec![item])
                 .await;
         }
+        TurnInput::FunctionCallOutput(item) => {
+            sess.record_conversation_items(turn_context, std::slice::from_ref(&item))
+                .await;
+            if let ResponseItem::FunctionCallOutput {
+                id: Some(id),
+                name: Some(name),
+                namespace,
+                output,
+                ..
+            } = item
+            {
+                let item = TurnItem::FunctionCallOutput(FunctionCallOutputItem {
+                    id: id.to_string(),
+                    name,
+                    namespace,
+                    output: output.body,
+                });
+                sess.emit_turn_item_started(turn_context, &item).await;
+                sess.emit_turn_item_completed(turn_context, item).await;
+            }
+            sess.ensure_rollout_materialized(persist_context).await;
+        }
+        TurnInput::InterAgentCommunication(communication) => {
+            sess.record_inter_agent_communication(turn_context, communication)
+                .await;
+        }
+    }
+    record_additional_contexts(sess, turn_context, additional_contexts).await;
+}
+
+/// Processes finished async hook results at a safe turn boundary.
+///
+/// Before the user prompt, records additional context directly into conversation
+/// history so results from a previous turn appear before the new prompt. After
+/// sampling, injects context into the active turn's pending-input queue so it
+/// reaches the next sampling request. Warnings and telemetry are handled in both
+/// cases.
+pub(crate) async fn drain_async_hook_results(
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
+    before_user_prompt: bool,
+) {
+    while let Ok(result) = sess.async_hook_results.try_recv() {
+        let additional_contexts = result
+            .run
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == HookOutputEntryKind::Context)
+            .map(|entry| entry.text.clone())
+            .collect::<Vec<_>>();
+
+        if before_user_prompt {
+            // A fresh user turn owns its root; automatic turns only inherit one.
+            let current_turn_id = Some(turn_context.sub_id.as_str());
+            if !additional_contexts.is_empty()
+                && result.turn_id.as_deref() != current_turn_id
+                && turn_context.turn_metadata_state.root_turn_id().as_deref() != current_turn_id
+            {
+                turn_context.turn_metadata_state.mark_root_turn_ambiguous();
+            }
+            record_additional_contexts(sess, turn_context, additional_contexts).await;
+        } else if !additional_contexts.is_empty() {
+            let _ = sess
+                .inject_hook_context_if_running(
+                    additional_context_messages(additional_contexts),
+                    result.turn_id.as_deref(),
+                )
+                .await;
+        }
+
+        for entry in &result.run.entries {
+            if entry.kind == HookOutputEntryKind::Warning {
+                sess.send_event(
+                    turn_context,
+                    EventMsg::Warning(WarningEvent {
+                        message: entry.text.clone(),
+                    }),
+                )
+                .await;
+            }
+        }
+
+        emit_hook_completed_events(sess, turn_context, vec![result]).await;
     }
 }
 
@@ -452,7 +859,10 @@ async fn emit_hook_started_events(
     turn_context: &Arc<TurnContext>,
     preview_runs: Vec<HookRunSummary>,
 ) {
-    for run in preview_runs {
+    for run in preview_runs
+        .into_iter()
+        .filter(|run| run.execution_mode == HookExecutionMode::Sync)
+    {
         sess.send_event(
             turn_context,
             EventMsg::HookStarted(HookStartedEvent {
@@ -469,11 +879,30 @@ pub(crate) async fn emit_hook_completed_events(
     turn_context: &Arc<TurnContext>,
     completed_events: Vec<HookCompletedEvent>,
 ) {
+    if turn_context.config.memories.disable_on_external_context
+        && completed_events.iter().any(|completed| {
+            completed.run.handler_type == HookHandlerType::McpTool
+                && matches!(
+                    completed.run.status,
+                    HookRunStatus::Completed | HookRunStatus::Blocked | HookRunStatus::Stopped
+                )
+        })
+    {
+        state_db::mark_thread_memory_mode_polluted(
+            sess.services.state_db.as_deref(),
+            sess.thread_id,
+            "mcp_tool_hook",
+        )
+        .await;
+    }
+
     for completed in completed_events {
         emit_hook_completed_metrics(turn_context, &completed);
         track_hook_completed_analytics(sess, turn_context, &completed);
-        sess.send_event(turn_context, EventMsg::HookCompleted(completed))
-            .await;
+        if completed.run.execution_mode == HookExecutionMode::Sync {
+            sess.send_event(turn_context, EventMsg::HookCompleted(completed))
+                .await;
+        }
     }
 }
 
@@ -499,7 +928,7 @@ fn track_hook_completed_analytics(
     completed: &HookCompletedEvent,
 ) {
     let (tracking, hook) =
-        hook_run_analytics_payload(sess.conversation_id.to_string(), turn_context, completed);
+        hook_run_analytics_payload(sess.thread_id.to_string(), turn_context, completed);
     sess.services
         .analytics_events_client
         .track_hook_run(tracking, hook);
@@ -512,22 +941,25 @@ fn hook_run_analytics_payload(
 ) -> (codex_analytics::TrackEventsContext, HookRunFact) {
     (
         build_track_events_context(
-            turn_context.model_info.slug.clone(),
+            turn_context.model_info().slug.clone(),
             thread_id,
             completed
                 .turn_id
                 .clone()
                 .unwrap_or_else(|| turn_context.sub_id.clone()),
+            turn_context.originator.clone(),
         ),
         HookRunFact {
             event_name: completed.run.event_name,
             hook_source: completed.run.source,
+            handler_type: completed.run.handler_type,
+            execution_mode: completed.run.execution_mode,
             status: completed.run.status,
         },
     )
 }
 
-fn hook_run_metric_tags(run: &HookRunSummary) -> [(&'static str, &'static str); 3] {
+fn hook_run_metric_tags(run: &HookRunSummary) -> [(&'static str, &'static str); 5] {
     let hook_name = match run.event_name {
         HookEventName::PreToolUse => "PreToolUse",
         HookEventName::PermissionRequest => "PermissionRequest",
@@ -535,8 +967,12 @@ fn hook_run_metric_tags(run: &HookRunSummary) -> [(&'static str, &'static str); 
         HookEventName::PreCompact => "PreCompact",
         HookEventName::PostCompact => "PostCompact",
         HookEventName::SessionStart => "SessionStart",
+        HookEventName::SessionEnd => "SessionEnd",
         HookEventName::UserPromptSubmit => "UserPromptSubmit",
+        HookEventName::SubagentStart => "SubagentStart",
+        HookEventName::SubagentStop => "SubagentStop",
         HookEventName::Stop => "Stop",
+        HookEventName::Interrupt => "Interrupt",
     };
     let hook_source = match run.source {
         HookSource::System => "system",
@@ -546,6 +982,7 @@ fn hook_run_metric_tags(run: &HookRunSummary) -> [(&'static str, &'static str); 
         HookSource::SessionFlags => "session_flags",
         HookSource::Plugin => "plugin",
         HookSource::CloudRequirements => "cloud_requirements",
+        HookSource::CloudManagedConfig => "cloud_managed_config",
         HookSource::LegacyManagedConfigFile => "legacy_managed_config_file",
         HookSource::LegacyManagedConfigMdm => "legacy_managed_config_mdm",
         HookSource::Unknown => "unknown",
@@ -557,23 +994,47 @@ fn hook_run_metric_tags(run: &HookRunSummary) -> [(&'static str, &'static str); 
         HookRunStatus::Blocked => "blocked",
         HookRunStatus::Stopped => "stopped",
     };
-
     [
         ("hook_name", hook_name),
         ("source", hook_source),
         ("status", status),
+        ("handler_type", hook_handler_type_label(run.handler_type)),
+        (
+            "execution_mode",
+            hook_execution_mode_label(run.execution_mode),
+        ),
     ]
 }
 
 fn hook_permission_mode(turn_context: &TurnContext) -> String {
-    match turn_context.approval_policy.value() {
+    match turn_context.approval_policy() {
         AskForApproval::Never => "bypassPermissions",
-        AskForApproval::UnlessTrusted
-        | AskForApproval::OnFailure
-        | AskForApproval::OnRequest
-        | AskForApproval::Granular(_) => "default",
+        AskForApproval::UnlessTrusted | AskForApproval::OnRequest | AskForApproval::Granular(_) => {
+            "default"
+        }
     }
     .to_string()
+}
+
+fn thread_spawn_subagent_hook_context(
+    sess: &Arc<Session>,
+    turn_context: &TurnContext,
+) -> Option<SubagentHookContext> {
+    match &turn_context.session_source {
+        SessionSource::SubAgent(SubAgentSource::ThreadSpawn { agent_role, .. }) => {
+            Some(subagent_hook_context(sess, agent_role))
+        }
+        _ => None,
+    }
+}
+
+fn subagent_hook_context(sess: &Arc<Session>, agent_role: &Option<String>) -> SubagentHookContext {
+    SubagentHookContext {
+        agent_id: sess.thread_id().to_string(),
+        agent_type: agent_role
+            .clone()
+            .unwrap_or_else(|| crate::agent::role::DEFAULT_ROLE_NAME.to_string()),
+    }
 }
 
 fn compaction_trigger_label(value: CompactionTrigger) -> &'static str {
@@ -595,9 +1056,12 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::additional_context_messages;
+    use super::emit_hook_completed_events;
+    use super::emit_hook_started_events;
     use super::hook_run_analytics_payload;
     use super::hook_run_metric_tags;
     use crate::session::tests::make_session_and_context;
+    use crate::session::tests::make_session_and_context_with_rx;
     use codex_protocol::protocol::HookCompletedEvent;
     use codex_protocol::protocol::HookRunSummary;
     use codex_utils_absolute_path::test_support::PathBufExt;
@@ -620,7 +1084,9 @@ mod tests {
                             .iter()
                             .map(|item| match item {
                                 ContentItem::InputText { text } => text.as_str(),
-                                ContentItem::InputImage { .. } | ContentItem::OutputText { .. } => {
+                                ContentItem::InputImage { .. }
+                                | ContentItem::InputAudio { .. }
+                                | ContentItem::OutputText { .. } => {
                                     panic!("expected input text content, got {item:?}")
                                 }
                             })
@@ -638,6 +1104,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hook_lifecycle_notifications_only_report_synchronous_runs() {
+        let (session, turn_context, events) = make_session_and_context_with_rx().await;
+        let mut synchronous_run = sample_hook_run(HookRunStatus::Running, HookSource::User);
+        synchronous_run.id = "synchronous-hook".to_string();
+        let mut asynchronous_run = synchronous_run.clone();
+        asynchronous_run.id = "asynchronous-hook".to_string();
+        asynchronous_run.execution_mode = HookExecutionMode::Async;
+
+        emit_hook_started_events(
+            &session,
+            &turn_context,
+            vec![asynchronous_run.clone(), synchronous_run.clone()],
+        )
+        .await;
+
+        let started = events.try_recv().expect("synchronous hook should start");
+        assert!(matches!(
+            started.msg,
+            codex_protocol::protocol::EventMsg::HookStarted(event)
+                if event.run.id == synchronous_run.id
+        ));
+        assert!(events.try_recv().is_err());
+
+        asynchronous_run.status = HookRunStatus::Completed;
+        synchronous_run.status = HookRunStatus::Completed;
+        emit_hook_completed_events(
+            &session,
+            &turn_context,
+            vec![
+                HookCompletedEvent {
+                    turn_id: Some(turn_context.sub_id.clone()),
+                    run: asynchronous_run,
+                },
+                HookCompletedEvent {
+                    turn_id: Some(turn_context.sub_id.clone()),
+                    run: synchronous_run.clone(),
+                },
+            ],
+        )
+        .await;
+
+        let completed = events.try_recv().expect("synchronous hook should complete");
+        assert!(matches!(
+            completed.msg,
+            codex_protocol::protocol::EventMsg::HookCompleted(event)
+                if event.run.id == synchronous_run.id
+        ));
+        assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn hook_run_analytics_payload_uses_completed_turn_id() {
         let (_session, turn_context) = make_session_and_context().await;
         let completed = HookCompletedEvent {
@@ -650,8 +1167,10 @@ mod tests {
 
         assert_eq!(tracking.thread_id, "thread-123");
         assert_eq!(tracking.turn_id, "turn-from-hook");
-        assert_eq!(tracking.model_slug, turn_context.model_info.slug);
+        assert_eq!(tracking.model_slug, turn_context.model_info().slug);
         assert_eq!(hook.event_name, HookEventName::Stop);
+        assert_eq!(hook.handler_type, HookHandlerType::Command);
+        assert_eq!(hook.execution_mode, HookExecutionMode::Sync);
         assert_eq!(hook.hook_source, HookSource::Project);
         assert_eq!(hook.status, HookRunStatus::Blocked);
     }
@@ -659,22 +1178,25 @@ mod tests {
     #[tokio::test]
     async fn hook_run_analytics_payload_falls_back_to_turn_context_id() {
         let (_session, turn_context) = make_session_and_context().await;
-        let completed = HookCompletedEvent {
-            turn_id: None,
-            run: sample_hook_run(HookRunStatus::Failed, HookSource::Unknown),
-        };
+        let mut run = sample_hook_run(HookRunStatus::Failed, HookSource::Unknown);
+        run.handler_type = HookHandlerType::Prompt;
+        run.execution_mode = HookExecutionMode::Async;
+        let completed = HookCompletedEvent { turn_id: None, run };
 
         let (tracking, hook) =
             hook_run_analytics_payload("thread-123".to_string(), &turn_context, &completed);
 
         assert_eq!(tracking.turn_id, turn_context.sub_id);
+        assert_eq!(hook.handler_type, HookHandlerType::Prompt);
+        assert_eq!(hook.execution_mode, HookExecutionMode::Async);
         assert_eq!(hook.hook_source, HookSource::Unknown);
         assert_eq!(hook.status, HookRunStatus::Failed);
     }
 
     #[test]
     fn hook_run_metric_tags_match_analytics_shape() {
-        let run = sample_hook_run(HookRunStatus::Blocked, HookSource::Project);
+        let mut run = sample_hook_run(HookRunStatus::Blocked, HookSource::Project);
+        run.handler_type = HookHandlerType::McpTool;
 
         assert_eq!(
             hook_run_metric_tags(&run),
@@ -682,6 +1204,8 @@ mod tests {
                 ("hook_name", "Stop"),
                 ("source", "project"),
                 ("status", "blocked"),
+                ("handler_type", "mcp_tool"),
+                ("execution_mode", "sync"),
             ]
         );
 
@@ -694,13 +1218,16 @@ mod tests {
                 ("hook_name", "Stop"),
                 ("source", "cloud_requirements"),
                 ("status", "blocked"),
+                ("handler_type", "command"),
+                ("execution_mode", "sync"),
             ]
         );
     }
 
     #[test]
     fn hook_run_metric_tags_include_expanded_hook_sources() {
-        let run = sample_hook_run(HookRunStatus::Completed, HookSource::LegacyManagedConfigMdm);
+        let mut run = sample_hook_run(HookRunStatus::Completed, HookSource::LegacyManagedConfigMdm);
+        run.execution_mode = HookExecutionMode::Async;
 
         assert_eq!(
             hook_run_metric_tags(&run),
@@ -708,6 +1235,8 @@ mod tests {
                 ("hook_name", "Stop"),
                 ("source", "legacy_managed_config_mdm"),
                 ("status", "completed"),
+                ("handler_type", "command"),
+                ("execution_mode", "async"),
             ]
         );
     }

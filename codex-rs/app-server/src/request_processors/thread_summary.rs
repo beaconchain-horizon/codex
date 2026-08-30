@@ -1,9 +1,9 @@
 use super::*;
-
 #[cfg(test)]
 use chrono::DateTime;
 #[cfg(test)]
 use chrono::Utc;
+use codex_protocol::config_types::MultiAgentMode;
 
 #[cfg(test)]
 pub(crate) async fn read_summary_from_rollout(
@@ -97,10 +97,7 @@ fn extract_conversation_summary(
             _ => None,
         })?;
 
-    let preview = match preview.find(USER_MESSAGE_BEGIN) {
-        Some(idx) => preview[idx + USER_MESSAGE_BEGIN.len()..].trim(),
-        None => preview.as_str(),
-    };
+    let preview = strip_user_message_prefix(preview.as_str());
 
     let timestamp = if session_meta.timestamp.is_empty() {
         None
@@ -134,7 +131,7 @@ fn map_git_info(git_info: &CoreGitInfo) -> ConversationGitInfo {
     ConversationGitInfo {
         sha: git_info.commit_hash.as_ref().map(|sha| sha.0.clone()),
         branch: git_info.branch.clone(),
-        origin_url: git_info.repository_url.clone(),
+        origin_url: git_info.repository_url.clone().map(String::from),
     }
 }
 
@@ -169,43 +166,32 @@ pub(super) fn with_thread_spawn_agent_metadata(
     }
 }
 
-pub(super) fn thread_response_active_permission_profile(
+pub(crate) fn thread_response_active_permission_profile(
     active_permission_profile: Option<codex_protocol::models::ActivePermissionProfile>,
 ) -> Option<codex_app_server_protocol::ActivePermissionProfile> {
     active_permission_profile.map(Into::into)
 }
 
-pub(super) fn apply_permission_profile_selection_to_config_overrides(
-    overrides: &mut ConfigOverrides,
-    permissions: Option<PermissionProfileSelectionParams>,
-) {
-    let Some(PermissionProfileSelectionParams::Profile { id, modifications }) = permissions else {
-        return;
-    };
-    overrides.default_permissions = Some(id);
-    overrides
-        .additional_writable_roots
-        .extend(modifications.unwrap_or_default().into_iter().map(
-            |modification| match modification {
-                PermissionProfileModificationParams::AdditionalWritableRoot { path } => {
-                    path.to_path_buf()
-                }
-            },
-        ));
-}
-
-pub(super) fn thread_response_sandbox_policy(
-    permission_profile: &codex_protocol::models::PermissionProfile,
-    cwd: &Path,
-) -> codex_app_server_protocol::SandboxPolicy {
-    let file_system_policy = permission_profile.file_system_sandbox_policy();
-    let sandbox_policy = codex_sandboxing::compatibility_sandbox_policy_for_permission_profile(
-        permission_profile,
-        &file_system_policy,
-        permission_profile.network_sandbox_policy(),
-        cwd,
-    );
-    sandbox_policy.into()
+pub(crate) fn thread_settings_from_config_snapshot(
+    config_snapshot: &ThreadConfigSnapshot,
+) -> ThreadSettings {
+    ThreadSettings {
+        cwd: config_snapshot.cwd().clone(),
+        approval_policy: config_snapshot.approval_policy.into(),
+        approvals_reviewer: config_snapshot.approvals_reviewer.into(),
+        sandbox_policy: config_snapshot.sandbox_policy().into(),
+        active_permission_profile: thread_response_active_permission_profile(
+            config_snapshot.active_permission_profile.clone(),
+        ),
+        model: config_snapshot.model.clone(),
+        model_provider: config_snapshot.model_provider_id.clone(),
+        service_tier: config_snapshot.service_tier.clone(),
+        effort: config_snapshot.reasoning_effort.clone(),
+        summary: config_snapshot.reasoning_summary,
+        collaboration_mode: config_snapshot.collaboration_mode.clone(),
+        multi_agent_mode: MultiAgentMode::ExplicitRequestOnly,
+        personality: config_snapshot.personality,
+    }
 }
 
 #[cfg(test)]
@@ -274,13 +260,20 @@ pub(crate) fn summary_to_thread(
     let thread_id = conversation_id.to_string();
     Thread {
         id: thread_id.clone(),
+        extra: None,
         session_id: thread_id,
         forked_from_id: None,
+        parent_thread_id: None,
         preview,
         ephemeral: false,
+        section: None,
+        section_entered_at: None,
+        project_id: None,
+        history_mode: ThreadHistoryMode::Legacy,
         model_provider,
         created_at: created_at.map(|dt| dt.timestamp()).unwrap_or(0),
         updated_at: updated_at.map(|dt| dt.timestamp()).unwrap_or(0),
+        recency_at: updated_at.map(|dt| dt.timestamp()),
         status: ThreadStatus::NotLoaded,
         path: (!path.as_os_str().is_empty()).then_some(path),
         cwd,
@@ -288,6 +281,7 @@ pub(crate) fn summary_to_thread(
         agent_nickname: source.get_nickname(),
         agent_role: source.get_agent_role(),
         source: source.into(),
+        can_accept_direct_input: None,
         thread_source: None,
         git_info,
         name: None,

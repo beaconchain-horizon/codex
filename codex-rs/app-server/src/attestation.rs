@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::Weak;
 
 use axum::http::HeaderValue;
 use codex_app_server_protocol::AttestationGenerateParams;
@@ -22,13 +23,13 @@ pub(crate) fn app_server_attestation_provider(
     thread_state_manager: ThreadStateManager,
 ) -> Arc<dyn AttestationProvider> {
     Arc::new(AppServerAttestationProvider {
-        outgoing,
+        outgoing: Arc::downgrade(&outgoing),
         thread_state_manager,
     })
 }
 
 struct AppServerAttestationProvider {
-    outgoing: Arc<OutgoingMessageSender>,
+    outgoing: Weak<OutgoingMessageSender>,
     thread_state_manager: ThreadStateManager,
 }
 
@@ -42,7 +43,9 @@ impl std::fmt::Debug for AppServerAttestationProvider {
 
 impl AttestationProvider for AppServerAttestationProvider {
     fn header_for_request(&self, context: AttestationContext) -> GenerateAttestationFuture<'_> {
-        let outgoing = self.outgoing.clone();
+        let Some(outgoing) = self.outgoing.upgrade() else {
+            return Box::pin(async { None });
+        };
         let thread_state_manager = self.thread_state_manager.clone();
         Box::pin(async move {
             request_attestation_header_value_with_timeout(
@@ -79,11 +82,8 @@ async fn request_attestation_header_value_with_timeout(
     let result = match timeout(timeout_duration, rx).await {
         Ok(Ok(Ok(result))) => result,
         Ok(Ok(Err(err))) => {
-            warn!(
-                code = err.code,
-                message = %err.message,
-                "attestation generation request failed"
-            );
+            // Don't log err.message because it may contain a token.
+            warn!(code = err.code, "attestation generation request failed");
             return app_server_attestation_header_value(
                 AppServerAttestationStatus::RequestFailed,
                 /*token*/ None,
@@ -115,7 +115,10 @@ async fn request_attestation_header_value_with_timeout(
             Some(&response.token),
         ),
         Err(err) => {
-            warn!("failed to deserialize attestation generation response: {err}");
+            warn!(
+                error_category = ?err.classify(),
+                "failed to deserialize attestation generation response"
+            );
             app_server_attestation_header_value(
                 AppServerAttestationStatus::MalformedResponse,
                 /*token*/ None,

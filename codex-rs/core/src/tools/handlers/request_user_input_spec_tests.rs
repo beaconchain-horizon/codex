@@ -2,6 +2,8 @@ use super::*;
 use codex_features::Feature;
 use codex_features::Features;
 use codex_protocol::config_types::ModeKind;
+use codex_protocol::request_user_input::RequestUserInputQuestion;
+use codex_protocol::request_user_input::RequestUserInputQuestionOption;
 use codex_tools::JsonSchema;
 use codex_tools::request_user_input_available_modes;
 use pretty_assertions::assert_eq;
@@ -26,7 +28,8 @@ fn request_user_input_tool_includes_questions_schema() {
             description: "Ask the user to choose.".to_string(),
             strict: false,
             defer_loading: None,
-            parameters: JsonSchema::object(BTreeMap::from([(
+            parameters: JsonSchema::object(BTreeMap::from([
+                (
                     "questions".to_string(),
                     JsonSchema::array(
                         JsonSchema::object(
@@ -96,9 +99,58 @@ fn request_user_input_tool_includes_questions_schema() {
                             "Questions to show the user. Prefer 1 and do not exceed 3".to_string(),
                         ),
                     ),
-                )]), Some(vec!["questions".to_string()]), Some(false.into())),
+                ),
+            ]),
+            Some(vec!["questions".to_string()]),
+            Some(false.into())),
             output_schema: None,
         })
+    );
+}
+
+#[test]
+fn normalize_request_user_input_tool_args_sets_other_on_every_question() {
+    let args = RequestUserInputToolArgs {
+        questions: vec![RequestUserInputQuestion {
+            id: "confirm".to_string(),
+            header: "Confirm".to_string(),
+            question: "Proceed?".to_string(),
+            is_other: false,
+            is_secret: false,
+            options: Some(vec![RequestUserInputQuestionOption {
+                label: "Yes (Recommended)".to_string(),
+                description: "Continue.".to_string(),
+            }]),
+        }],
+    };
+
+    assert_eq!(
+        normalize_request_user_input_tool_args(args.clone()),
+        Ok(RequestUserInputToolArgs {
+            questions: vec![RequestUserInputQuestion {
+                is_other: true,
+                ..args.questions[0].clone()
+            }],
+        })
+    );
+}
+
+#[test]
+fn normalize_request_user_input_tool_args_rejects_missing_options() {
+    let args = RequestUserInputToolArgs {
+        questions: vec![RequestUserInputQuestion {
+            id: "confirm".to_string(),
+            header: "Confirm".to_string(),
+            question: "Proceed?".to_string(),
+            is_other: false,
+            is_secret: false,
+            options: None,
+        }],
+    };
+
+    assert_eq!(
+        normalize_request_user_input_tool_args(args),
+        Err("request_user_input requires non-empty options for every question".to_string())
     );
 }
 
@@ -119,17 +171,6 @@ fn request_user_input_unavailable_messages_respect_default_mode_feature_flag() {
         ),
         None
     );
-    assert_eq!(
-        request_user_input_unavailable_message(ModeKind::Execute, &default_available_modes()),
-        Some("request_user_input is unavailable in Execute mode".to_string())
-    );
-    assert_eq!(
-        request_user_input_unavailable_message(
-            ModeKind::PairProgramming,
-            &default_available_modes()
-        ),
-        Some("request_user_input is unavailable in Pair Programming mode".to_string())
-    );
 }
 
 #[test]
@@ -141,5 +182,9 @@ fn request_user_input_tool_description_mentions_available_modes() {
     assert_eq!(
         request_user_input_tool_description(&default_mode_enabled_available_modes()),
         "Request user input for one to three short questions and wait for the response. This tool is only available in Default or Plan mode.".to_string()
+    );
+    assert_eq!(
+        request_user_input_tool_description(&[ModeKind::Default]),
+        "Request user input for one to three short questions and wait for the response. This tool is only available in Default mode.".to_string()
     );
 }

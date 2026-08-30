@@ -8,16 +8,15 @@ use crate::bottom_pane::SelectionViewParams;
 use crate::bottom_pane::SkillsToggleItem;
 use crate::bottom_pane::SkillsToggleView;
 use crate::bottom_pane::popup_consts::standard_popup_hint_line;
+use crate::mention_codec::is_common_env_var;
+use crate::mention_codec::is_mention_name_char;
+use crate::mention_codec::parse_linked_tool_mention;
 use crate::skills_helpers::skill_description;
 use crate::skills_helpers::skill_display_name;
-use codex_app_server_protocol::AppInfo;
-use codex_app_server_protocol::SkillMetadata as ProtocolSkillMetadata;
+use codex_app_server_protocol::SkillMetadata;
 use codex_app_server_protocol::SkillsListEntry;
 use codex_app_server_protocol::SkillsListResponse;
-use codex_core_skills::model::SkillDependencies;
-use codex_core_skills::model::SkillInterface;
-use codex_core_skills::model::SkillMetadata;
-use codex_core_skills::model::SkillToolDependency;
+use codex_connectors::AppInfo;
 use codex_protocol::parse_command::ParsedCommand;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_plugins::mention_syntax::TOOL_MENTION_SIGIL;
@@ -73,23 +72,24 @@ impl ChatWidget {
         let items: Vec<SkillsToggleItem> = self
             .skills_all
             .iter()
-            .filter_map(|skill| {
-                let core_skill = protocol_skill_to_core(skill)?;
-                let display_name = skill_display_name(&core_skill);
-                let description = skill_description(&core_skill).to_string();
-                let name = core_skill.name.clone();
-                let path = core_skill.path_to_skills_md;
-                Some(SkillsToggleItem {
+            .map(|skill| {
+                let display_name = skill_display_name(skill);
+                let description = skill_description(skill).to_string();
+                SkillsToggleItem {
                     name: display_name,
-                    skill_name: name,
+                    skill_name: skill.name.clone(),
                     description,
                     enabled: skill.enabled,
-                    path,
-                })
+                    path: skill.path.clone(),
+                }
             })
             .collect();
 
-        let view = SkillsToggleView::new(items, self.app_event_tx.clone());
+        let view = SkillsToggleView::new(
+            items,
+            self.app_event_tx.clone(),
+            self.bottom_pane.list_keymap(),
+        );
         self.bottom_pane.show_view(Box::new(view));
     }
 
@@ -171,10 +171,7 @@ impl ChatWidget {
     }
 }
 
-fn skills_for_cwd(
-    cwd: &AbsolutePathBuf,
-    skills_entries: &[SkillsListEntry],
-) -> Vec<ProtocolSkillMetadata> {
+fn skills_for_cwd(cwd: &AbsolutePathBuf, skills_entries: &[SkillsListEntry]) -> Vec<SkillMetadata> {
     skills_entries
         .iter()
         .find(|entry| entry.cwd.as_path() == cwd.as_path())
@@ -182,60 +179,12 @@ fn skills_for_cwd(
         .unwrap_or_default()
 }
 
-fn enabled_skills_for_mentions(skills: &[ProtocolSkillMetadata]) -> Vec<SkillMetadata> {
+fn enabled_skills_for_mentions(skills: &[SkillMetadata]) -> Vec<SkillMetadata> {
     skills
         .iter()
         .filter(|skill| skill.enabled)
-        .filter_map(protocol_skill_to_core)
+        .cloned()
         .collect()
-}
-
-fn protocol_skill_to_core(skill: &ProtocolSkillMetadata) -> Option<SkillMetadata> {
-    let scope = serde_json::to_value(skill.scope)
-        .and_then(serde_json::from_value)
-        .inspect_err(|err| {
-            tracing::warn!(
-                skill_name = %skill.name,
-                %err,
-                "Failed to map app-server skill scope"
-            );
-        })
-        .ok()?;
-
-    Some(SkillMetadata {
-        name: skill.name.clone(),
-        description: skill.description.clone(),
-        short_description: skill.short_description.clone(),
-        interface: skill.interface.clone().map(|interface| SkillInterface {
-            display_name: interface.display_name,
-            short_description: interface.short_description,
-            icon_small: interface.icon_small,
-            icon_large: interface.icon_large,
-            brand_color: interface.brand_color,
-            default_prompt: interface.default_prompt,
-        }),
-        dependencies: skill
-            .dependencies
-            .clone()
-            .map(|dependencies| SkillDependencies {
-                tools: dependencies
-                    .tools
-                    .into_iter()
-                    .map(|tool| SkillToolDependency {
-                        r#type: tool.r#type,
-                        value: tool.value,
-                        description: tool.description,
-                        transport: tool.transport,
-                        command: tool.command,
-                        url: tool.url,
-                    })
-                    .collect(),
-            }),
-        policy: None,
-        path_to_skills_md: skill.path.clone(),
-        scope,
-        plugin_id: None,
-    })
 }
 
 pub(crate) fn collect_tool_mentions(
@@ -267,23 +216,23 @@ pub(crate) fn find_skill_mentions_with_tool_mentions(
     let mut matches: Vec<SkillMetadata> = Vec::new();
 
     for skill in skills {
-        if seen_paths.contains(&skill.path_to_skills_md) {
+        if seen_paths.contains(&skill.path) {
             continue;
         }
-        let path_str = skill.path_to_skills_md.to_string_lossy();
+        let path_str = skill.path.to_string_lossy();
         if mention_skill_paths.contains(path_str.as_ref()) {
-            seen_paths.insert(skill.path_to_skills_md.clone());
+            seen_paths.insert(skill.path.clone());
             seen_names.insert(skill.name.clone());
             matches.push(skill.clone());
         }
     }
 
     for skill in skills {
-        if seen_paths.contains(&skill.path_to_skills_md) {
+        if seen_paths.contains(&skill.path) {
             continue;
         }
         if mentions.names.contains(&skill.name) && seen_names.insert(skill.name.clone()) {
-            seen_paths.insert(skill.path_to_skills_md.clone());
+            seen_paths.insert(skill.path.clone());
             matches.push(skill.clone());
         }
     }
@@ -306,12 +255,12 @@ pub(crate) fn find_app_mentions(
     }
 
     let mut slug_counts: HashMap<String, usize> = HashMap::new();
-    for app in apps.iter().filter(|app| app.is_enabled) {
+    for app in apps.iter().filter(|app| is_app_mentionable(app)) {
         let slug = codex_connectors::metadata::connector_mention_slug(app);
         *slug_counts.entry(slug).or_insert(0) += 1;
     }
 
-    for app in apps.iter().filter(|app| app.is_enabled) {
+    for app in apps.iter().filter(|app| is_app_mentionable(app)) {
         let slug = codex_connectors::metadata::connector_mention_slug(app);
         let slug_count = slug_counts.get(&slug).copied().unwrap_or(0);
         if mentions.names.contains(&slug)
@@ -324,9 +273,13 @@ pub(crate) fn find_app_mentions(
     }
 
     apps.iter()
-        .filter(|app| app.is_enabled && selected_ids.contains(&app.id))
+        .filter(|app| is_app_mentionable(app) && selected_ids.contains(&app.id))
         .cloned()
         .collect()
+}
+
+pub(crate) fn is_app_mentionable(app: &AppInfo) -> bool {
+    app.is_accessible && app.is_enabled
 }
 
 pub(crate) struct ToolMentions {
@@ -347,8 +300,7 @@ fn extract_tool_mentions_from_text_with_sigil(text: &str, sigil: char) -> ToolMe
     while index < text_bytes.len() {
         let byte = text_bytes[index];
         if byte == b'['
-            && let Some((name, path, end_index)) =
-                parse_linked_tool_mention(text, text_bytes, index, sigil)
+            && let Some((name, path, end_index)) = parse_linked_tool_mention(text, index, sigil)
         {
             if !is_common_env_var(name) {
                 if is_skill_path(path) {
@@ -397,85 +349,6 @@ fn extract_tool_mentions_from_text_with_sigil(text: &str, sigil: char) -> ToolMe
     }
 }
 
-fn parse_linked_tool_mention<'a>(
-    text: &'a str,
-    text_bytes: &[u8],
-    start: usize,
-    sigil: char,
-) -> Option<(&'a str, &'a str, usize)> {
-    let sigil_index = start + 1;
-    if text_bytes.get(sigil_index) != Some(&(sigil as u8)) {
-        return None;
-    }
-
-    let name_start = sigil_index + 1;
-    let first_name_byte = text_bytes.get(name_start)?;
-    if !is_mention_name_char(*first_name_byte) {
-        return None;
-    }
-
-    let mut name_end = name_start + 1;
-    while let Some(next_byte) = text_bytes.get(name_end)
-        && is_mention_name_char(*next_byte)
-    {
-        name_end += 1;
-    }
-
-    if text_bytes.get(name_end) != Some(&b']') {
-        return None;
-    }
-
-    let mut path_start = name_end + 1;
-    while let Some(next_byte) = text_bytes.get(path_start)
-        && next_byte.is_ascii_whitespace()
-    {
-        path_start += 1;
-    }
-    if text_bytes.get(path_start) != Some(&b'(') {
-        return None;
-    }
-
-    let mut path_end = path_start + 1;
-    while let Some(next_byte) = text_bytes.get(path_end)
-        && *next_byte != b')'
-    {
-        path_end += 1;
-    }
-    if text_bytes.get(path_end) != Some(&b')') {
-        return None;
-    }
-
-    let path = text[path_start + 1..path_end].trim();
-    if path.is_empty() {
-        return None;
-    }
-
-    let name = &text[name_start..name_end];
-    Some((name, path, path_end + 1))
-}
-
-fn is_common_env_var(name: &str) -> bool {
-    let upper = name.to_ascii_uppercase();
-    matches!(
-        upper.as_str(),
-        "PATH"
-            | "HOME"
-            | "USER"
-            | "SHELL"
-            | "PWD"
-            | "TMPDIR"
-            | "TEMP"
-            | "TMP"
-            | "LANG"
-            | "TERM"
-            | "XDG_CONFIG_HOME"
-    )
-}
-
-fn is_mention_name_char(byte: u8) -> bool {
-    matches!(byte, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-')
-}
-
 fn is_skill_path(path: &str) -> bool {
     !path.starts_with("app://") && !path.starts_with("mcp://") && !path.starts_with("plugin://")
 }
@@ -487,4 +360,77 @@ fn normalize_skill_path(path: &str) -> &str {
 fn app_id_from_path(path: &str) -> Option<&str> {
     path.strip_prefix("app://")
         .filter(|value| !value.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    fn app(id: &str, name: &str) -> AppInfo {
+        AppInfo {
+            id: id.to_string(),
+            name: name.to_string(),
+            description: None,
+            logo_url: None,
+            logo_url_dark: None,
+            icon_assets: None,
+            icon_dark_assets: None,
+            distribution_channel: None,
+            branding: None,
+            app_metadata: None,
+            labels: None,
+            install_url: None,
+            is_accessible: true,
+            is_enabled: true,
+            plugin_display_names: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn find_app_mentions_requires_accessible_enabled_apps_for_slugs() {
+        let apps = vec![
+            app("google_drive", "Google Drive"),
+            AppInfo {
+                is_accessible: false,
+                ..app("arabica_uae", "% Arabica UAE")
+            },
+            AppInfo {
+                is_enabled: false,
+                ..app("linear", "Linear")
+            },
+        ];
+        let mentions = collect_tool_mentions("$google-drive $arabica-uae $linear", &HashMap::new());
+
+        assert_eq!(
+            find_app_mentions(&mentions, &apps, &HashSet::new()),
+            vec![apps[0].clone()]
+        );
+    }
+
+    #[test]
+    fn find_app_mentions_requires_accessible_enabled_apps_for_bound_paths() {
+        let apps = vec![
+            app("google_drive", "Google Drive"),
+            AppInfo {
+                is_accessible: false,
+                ..app("arabica_uae", "% Arabica UAE")
+            },
+            AppInfo {
+                is_enabled: false,
+                ..app("linear", "Linear")
+            },
+        ];
+        let mention_paths = HashMap::from([
+            ("google-drive".to_string(), "app://google_drive".to_string()),
+            ("arabica-uae".to_string(), "app://arabica_uae".to_string()),
+            ("linear".to_string(), "app://linear".to_string()),
+        ]);
+        let mentions = collect_tool_mentions("$google-drive $arabica-uae $linear", &mention_paths);
+
+        assert_eq!(
+            find_app_mentions(&mentions, &apps, &HashSet::new()),
+            vec![apps[0].clone()]
+        );
+    }
 }

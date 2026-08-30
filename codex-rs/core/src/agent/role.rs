@@ -1,24 +1,28 @@
-//! Applies agent-role configuration layers on top of an existing session config.
+//! Applies bounded agent-role overrides to an existing session config.
 //!
-//! Roles are selected at spawn time and are loaded with the same config machinery as
-//! `config.toml`. This module resolves built-in and user-defined role files, inserts the role as a
-//! high-precedence layer, and preserves the caller's current profile/provider unless the role
-//! explicitly takes ownership of model selection. It does not decide when to spawn a sub-agent or
-//! which role to use; the multi-agent tool handler owns that orchestration.
+//! Roles may customize the child or reduce its capabilities, but never replace the parent
+//! session's authority. A projected layer keeps existing layer-based consumers in sync.
 
 use crate::config::AgentRoleConfig;
 use crate::config::Config;
-use crate::config::ConfigOverrides;
-use crate::config::agent_roles::parse_agent_role_file_contents;
 use crate::config::deserialize_config_toml_with_base;
 use anyhow::anyhow;
-use codex_app_server_protocol::ConfigLayerSource;
+use codex_agent_roles::parse_agent_role_file_contents;
 use codex_config::ConfigLayerEntry;
+use codex_config::ConfigLayerSource;
 use codex_config::ConfigLayerStack;
-use codex_config::ConfigLayerStackOrdering;
-use codex_config::config_toml::ConfigToml;
+use codex_config::SkillsConfig;
 use codex_config::loader::resolve_relative_paths_in_config_toml;
-use codex_exec_server::LOCAL_FS;
+use codex_exec_server::read_sensitive_file_to_string;
+use codex_features::Feature;
+use codex_features::feature_for_key;
+use codex_protocol::config_types::Personality;
+use codex_protocol::config_types::ReasoningSummary;
+use codex_protocol::config_types::ServiceTier;
+use codex_protocol::config_types::Verbosity;
+use codex_protocol::models::BaseInstructionsProvenance;
+use codex_protocol::openai_models::ReasoningEffort;
+use serde::Serialize;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -29,14 +33,21 @@ use toml::Value as TomlValue;
 pub const DEFAULT_ROLE_NAME: &str = "default";
 const AGENT_TYPE_UNAVAILABLE_ERROR: &str = "agent type is currently not available";
 
-/// Applies a named role layer to `config` while preserving caller-owned model selection.
-///
-/// The role layer is inserted at session-flag precedence so it can override persisted config, but
-/// the caller's current `profile` and `model_provider` remain sticky runtime choices unless the
-/// role explicitly sets `profile`, explicitly sets `model_provider`, or rewrites the active
-/// profile's `model_provider` in place. Rebuilding the config without those overrides would make a
-/// spawned agent silently fall back to the default provider, which is the bug this preservation
-/// logic avoids.
+#[derive(Default, Serialize)]
+struct AgentRoleOverrides {
+    developer_instructions: Option<String>,
+    model: Option<String>,
+    model_reasoning_effort: Option<ReasoningEffort>,
+    model_reasoning_summary: Option<ReasoningSummary>,
+    model_verbosity: Option<Verbosity>,
+    personality: Option<Personality>,
+    service_tier: Option<String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    features: BTreeMap<String, bool>,
+    skills: Option<SkillsConfig>,
+}
+
+/// Applies typed role overrides to the existing parent-derived configuration.
 pub(crate) async fn apply_role_to_config(
     config: &mut Config,
     role_name: Option<&str>,
@@ -65,22 +76,55 @@ async fn apply_role_to_config_inner(
         return Ok(());
     };
     let role_layer_toml = load_role_layer_toml(config, config_file, is_built_in, role_name).await?;
+    let role_config = deserialize_config_toml_with_base(role_layer_toml, &config.codex_home)?;
+    let mut overrides = AgentRoleOverrides {
+        developer_instructions: role_config.developer_instructions,
+        model: role_config.model,
+        model_reasoning_effort: role_config.model_reasoning_effort,
+        model_reasoning_summary: role_config.model_reasoning_summary,
+        model_verbosity: role_config.model_verbosity,
+        personality: role_config.personality,
+        service_tier: role_config.service_tier,
+        ..Default::default()
+    };
+
+    if let Some(features) = role_config.features {
+        for (key, enabled) in features.entries() {
+            if !enabled
+                && let Some(
+                    feature @ (Feature::ShellTool
+                    | Feature::Apps
+                    | Feature::Personality
+                    | Feature::Plugins
+                    | Feature::MemoryTool
+                    | Feature::RequestPermissionsTool),
+                ) = feature_for_key(&key)
+            {
+                overrides.features.insert(feature.key().to_string(), false);
+            }
+        }
+    }
+    if let Some(mut skills) = role_config.skills {
+        skills.config.retain(|skill| !skill.enabled);
+        skills.bundled = skills.bundled.filter(|bundled| !bundled.enabled);
+        skills.include_instructions = skills.include_instructions.filter(|enabled| !enabled);
+        skills.max_context_tokens = None;
+        if !skills.config.is_empty()
+            || skills.bundled.is_some()
+            || skills.include_instructions.is_some()
+        {
+            overrides.skills = Some(skills);
+        }
+    }
+
+    let role_layer_toml = TomlValue::try_from(&overrides)?;
     if role_layer_toml
         .as_table()
         .is_some_and(toml::map::Map::is_empty)
     {
         return Ok(());
     }
-    let (preserve_current_profile, preserve_current_provider) =
-        preservation_policy(config, &role_layer_toml);
-
-    *config = reload::build_next_config(
-        config,
-        role_layer_toml,
-        preserve_current_profile,
-        preserve_current_provider,
-    )
-    .await?;
+    *config = role_overrides::build_next_config(config, role_layer_toml, &overrides)?;
     Ok(())
 }
 
@@ -97,7 +141,7 @@ async fn load_role_layer_toml(
         let role_config_toml: TomlValue = toml::from_str(&role_config_contents)?;
         (role_config_toml, config.codex_home.as_path())
     } else {
-        let role_config_contents = tokio::fs::read_to_string(config_file).await?;
+        let role_config_contents = read_sensitive_file_to_string(config_file).await?;
         let role_config_base = config_file
             .parent()
             .ok_or(anyhow!("No corresponding config content"))?;
@@ -128,56 +172,67 @@ pub(crate) fn resolve_role_config<'a>(
         .or_else(|| built_in::configs().get(role_name))
 }
 
-fn preservation_policy(config: &Config, role_layer_toml: &TomlValue) -> (bool, bool) {
-    let role_selects_provider = role_layer_toml.get("model_provider").is_some();
-    let role_selects_profile = role_layer_toml.get("profile").is_some();
-    let role_updates_active_profile_provider = config
-        .active_profile
-        .as_ref()
-        .and_then(|active_profile| {
-            role_layer_toml
-                .get("profiles")
-                .and_then(TomlValue::as_table)
-                .and_then(|profiles| profiles.get(active_profile))
-                .and_then(TomlValue::as_table)
-                .map(|profile| profile.contains_key("model_provider"))
-        })
-        .unwrap_or(false);
-    let preserve_current_profile = !role_selects_provider && !role_selects_profile;
-    let preserve_current_provider =
-        preserve_current_profile && !role_updates_active_profile_provider;
-    (preserve_current_profile, preserve_current_provider)
-}
-
-mod reload {
+mod role_overrides {
     use super::*;
 
-    pub(super) async fn build_next_config(
+    pub(super) fn build_next_config(
         config: &Config,
         role_layer_toml: TomlValue,
-        preserve_current_profile: bool,
-        preserve_current_provider: bool,
+        overrides: &AgentRoleOverrides,
     ) -> anyhow::Result<Config> {
-        let active_profile_name = preserve_current_profile
-            .then_some(config.active_profile.as_deref())
-            .flatten();
-        let config_layer_stack =
-            build_config_layer_stack(config, &role_layer_toml, active_profile_name)?;
-        let mut merged_config = deserialize_effective_config(config, &config_layer_stack)?;
-        if preserve_current_profile {
-            merged_config.profile = None;
+        let mut next_config = config.clone();
+        next_config.config_layer_stack = build_config_layer_stack(config, &role_layer_toml)?;
+        if let Some(model) = &overrides.model {
+            next_config.model = Some(model.clone());
         }
-
-        let mut next_config = Config::load_config_with_layer_stack(
-            LOCAL_FS.as_ref(),
-            merged_config,
-            reload_overrides(config, preserve_current_provider),
-            config.codex_home.clone(),
-            config_layer_stack,
-        )
-        .await?;
-        if preserve_current_profile {
-            next_config.active_profile = config.active_profile.clone();
+        if let Some(instructions) = &overrides.developer_instructions {
+            next_config.developer_instructions = Some(instructions.clone());
+        }
+        if let Some(effort) = overrides.model_reasoning_effort.clone() {
+            next_config.model_reasoning_effort = Some(effort);
+        }
+        if let Some(summary) = overrides.model_reasoning_summary {
+            next_config.model_reasoning_summary = Some(summary);
+        }
+        if let Some(verbosity) = overrides.model_verbosity {
+            next_config.model_verbosity = Some(verbosity);
+        }
+        if let Some(personality) = overrides.personality {
+            next_config.personality = Some(personality);
+        }
+        if let Some(service_tier) = &overrides.service_tier {
+            next_config.service_tier = match ServiceTier::from_request_value(service_tier) {
+                Some(ServiceTier::Fast) => next_config
+                    .features
+                    .enabled(Feature::FastMode)
+                    .then(|| ServiceTier::Fast.request_value().to_string()),
+                Some(ServiceTier::Flex) => Some(ServiceTier::Flex.request_value().to_string()),
+                None => Some(service_tier.clone()),
+            };
+        }
+        for key in overrides.features.keys() {
+            if let Some(feature) = feature_for_key(key) {
+                next_config.features.disable(feature)?;
+            }
+        }
+        if overrides
+            .skills
+            .as_ref()
+            .is_some_and(|skills| skills.include_instructions == Some(false))
+        {
+            next_config.include_skill_instructions = false;
+        }
+        let personality_changed = config.personality != next_config.personality
+            || config.features.enabled(Feature::Personality)
+                != next_config.features.enabled(Feature::Personality);
+        if personality_changed
+            && matches!(
+                config.base_instructions_provenance,
+                Some(BaseInstructionsProvenance::Model { .. })
+            )
+        {
+            next_config.base_instructions = None;
+            next_config.base_instructions_provenance = None;
         }
         Ok(next_config)
     }
@@ -185,90 +240,26 @@ mod reload {
     fn build_config_layer_stack(
         config: &Config,
         role_layer_toml: &TomlValue,
-        active_profile_name: Option<&str>,
     ) -> anyhow::Result<ConfigLayerStack> {
-        let mut layers = existing_layers(config);
-        if let Some(resolved_profile_layer) =
-            resolved_profile_layer(config, &layers, role_layer_toml, active_profile_name)?
-        {
-            insert_layer(&mut layers, resolved_profile_layer);
-        }
-        insert_layer(&mut layers, role_layer(role_layer_toml.clone()));
+        let mut layers: Vec<_> = config
+            .config_layer_stack
+            .all_layers_low_to_high()
+            .cloned()
+            .collect();
+        let role_layer =
+            ConfigLayerEntry::new(ConfigLayerSource::SessionFlags, role_layer_toml.clone());
+        let insertion_index = layers.partition_point(|layer| layer.name <= role_layer.name);
+        layers.insert(insertion_index, role_layer);
         Ok(ConfigLayerStack::new(
             layers,
             config.config_layer_stack.requirements().clone(),
             config.config_layer_stack.requirements_toml().clone(),
-        )?)
-    }
-
-    fn resolved_profile_layer(
-        config: &Config,
-        existing_layers: &[ConfigLayerEntry],
-        role_layer_toml: &TomlValue,
-        active_profile_name: Option<&str>,
-    ) -> anyhow::Result<Option<ConfigLayerEntry>> {
-        let Some(active_profile_name) = active_profile_name else {
-            return Ok(None);
-        };
-
-        let mut layers = existing_layers.to_vec();
-        insert_layer(&mut layers, role_layer(role_layer_toml.clone()));
-        let merged_config = deserialize_effective_config(
-            config,
-            &ConfigLayerStack::new(
-                layers,
-                config.config_layer_stack.requirements().clone(),
-                config.config_layer_stack.requirements_toml().clone(),
-            )?,
-        )?;
-        let resolved_profile =
-            merged_config.get_config_profile(Some(active_profile_name.to_string()))?;
-        Ok(Some(ConfigLayerEntry::new(
-            ConfigLayerSource::SessionFlags,
-            TomlValue::try_from(resolved_profile)?,
-        )))
-    }
-
-    fn deserialize_effective_config(
-        config: &Config,
-        config_layer_stack: &ConfigLayerStack,
-    ) -> anyhow::Result<ConfigToml> {
-        Ok(deserialize_config_toml_with_base(
-            config_layer_stack.effective_config(),
-            &config.codex_home,
-        )?)
-    }
-
-    fn existing_layers(config: &Config) -> Vec<ConfigLayerEntry> {
-        config
-            .config_layer_stack
-            .get_layers(
-                ConfigLayerStackOrdering::LowestPrecedenceFirst,
-                /*include_disabled*/ true,
-            )
-            .into_iter()
-            .cloned()
-            .collect()
-    }
-
-    fn insert_layer(layers: &mut Vec<ConfigLayerEntry>, layer: ConfigLayerEntry) {
-        let insertion_index =
-            layers.partition_point(|existing_layer| existing_layer.name <= layer.name);
-        layers.insert(insertion_index, layer);
-    }
-
-    fn role_layer(role_layer_toml: TomlValue) -> ConfigLayerEntry {
-        ConfigLayerEntry::new(ConfigLayerSource::SessionFlags, role_layer_toml)
-    }
-
-    fn reload_overrides(config: &Config, preserve_current_provider: bool) -> ConfigOverrides {
-        ConfigOverrides {
-            cwd: Some(config.cwd.to_path_buf()),
-            model_provider: preserve_current_provider.then(|| config.model_provider_id.clone()),
-            codex_linux_sandbox_exe: config.codex_linux_sandbox_exe.clone(),
-            main_execve_wrapper_exe: config.main_execve_wrapper_exe.clone(),
-            ..Default::default()
-        }
+        )?
+        .with_user_and_project_exec_policy_rules_ignored(
+            config
+                .config_layer_stack
+                .ignore_user_and_project_exec_policy_rules(),
+        ))
     }
 }
 
@@ -299,10 +290,7 @@ pub(crate) mod spawn_tool_spec {
             }
         }
 
-        format!(
-            "Optional type name for the new agent. If omitted, `{DEFAULT_ROLE_NAME}` is used.\nAvailable roles:\n{}",
-            formatted_roles.join("\n"),
-        )
+        format!("Available roles:\n{}", formatted_roles.join("\n"))
     }
 
     fn format_role(name: &str, declaration: &AgentRoleConfig) -> String {
@@ -323,7 +311,6 @@ pub(crate) mod spawn_tool_spec {
                     let reasoning_effort = role_toml
                         .get("model_reasoning_effort")
                         .and_then(TomlValue::as_str);
-
                     match (model, reasoning_effort) {
                         (Some(model), Some(reasoning_effort)) => format!(
                             "\n- This role's model is set to `{model}` and its reasoning effort is set to `{reasoning_effort}`. These settings cannot be changed."
@@ -418,8 +405,8 @@ Rules:
 
     /// Resolves a built-in role `config_file` path to embedded content.
     pub(super) fn config_file_contents(path: &Path) -> Option<&'static str> {
-        const EXPLORER: &str = include_str!("builtins/explorer.toml");
-        const AWAITER: &str = include_str!("builtins/awaiter.toml");
+        const EXPLORER: &str = include_str!("../../assets/agent/builtins/explorer.toml");
+        const AWAITER: &str = include_str!("../../assets/agent/builtins/awaiter.toml");
         match path.to_str()? {
             "explorer.toml" => Some(EXPLORER),
             "awaiter.toml" => Some(AWAITER),

@@ -13,8 +13,13 @@ import type { SandboxMode } from "./SandboxMode";
  * 2. By history: instantiate the thread from memory and resume it.
  * 3. By path: load the thread from disk by path and resume it.
  *
- * The precedence is: history > path > thread_id.
- * If using history or path, the thread_id param will be ignored.
+ * For non-running threads, the precedence is: history > non-empty path > thread_id.
+ * If using history or a non-empty path for a non-running thread, the thread_id
+ * param will be ignored.
+ *
+ * If thread_id identifies a running thread, app-server rejoins that thread and
+ * treats a non-empty path as a consistency check against the active rollout path.
+ * Empty string path values are treated as absent.
  *
  * Prefer using thread_id whenever possible.
  */
@@ -25,4 +30,11 @@ model?: string | null, modelProvider?: string | null, serviceTier?: string | nul
  * Override where approval requests are routed for review on this thread
  * and subsequent turns.
  */
-approvalsReviewer?: ApprovalsReviewer | null, sandbox?: SandboxMode | null, config?: { [key in string]?: JsonValue } | null, baseInstructions?: string | null, developerInstructions?: string | null, personality?: Personality | null};
+approvalsReviewer?: ApprovalsReviewer | null, sandbox?: SandboxMode | null, config?: { [key in string]?: JsonValue } | null, baseInstructions?: string | null, developerInstructions?: string | null, personality?: Personality | null, /**
+ * When true, return only thread metadata and live-resume state without
+ * populating `thread.turns`. This is useful when the client plans to call
+ * `thread/turns/list` immediately after resuming. Full-history hydration
+ * is deprecated for paginated threads; use this with `thread/turns/list`
+ * and `thread/items/list` instead.
+ */
+excludeTurns?: boolean};

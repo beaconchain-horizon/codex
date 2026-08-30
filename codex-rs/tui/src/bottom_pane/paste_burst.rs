@@ -9,32 +9,35 @@
 //! - Avoid flicker caused by inserting a typed prefix and then immediately reclassifying it as
 //!   paste once enough chars have arrived.
 //!
-//! This module provides the `PasteBurst` state machine. `ChatComposer` feeds it only "plain"
-//! character events (no Ctrl/Alt) and uses its decisions to either:
+//! This module provides the `PasteBurst` state machine. `ChatComposer` feeds it only
+//! text-producing character events (plain, Shift, or Windows AltGr) and uses the full buffering
+//! decisions to either:
 //!
 //! - briefly hold a first ASCII char (flicker suppression),
 //! - buffer a burst as a single pasted string, or
 //! - let input flow through as normal typing.
-//!
-//! For the higher-level view of how `PasteBurst` integrates with `ChatComposer`, see
-//! `docs/tui-chat-composer.md`.
 //!
 //! # Call Pattern
 //!
 //! `PasteBurst` is a pure state machine: it never mutates the textarea directly. The caller feeds
 //! it events and then applies the chosen action:
 //!
-//! - For each plain `KeyCode::Char`, call [`PasteBurst::on_plain_char`] (ASCII) or
+//! - For each text-producing `KeyCode::Char`, call [`PasteBurst::on_plain_char`] (ASCII) or
 //!   [`PasteBurst::on_plain_char_no_hold`] (non-ASCII/IME).
 //! - If the decision indicates buffering, the caller appends to `PasteBurst.buffer` via
 //!   [`PasteBurst::append_char_to_buffer`].
 //! - On a UI tick, call [`PasteBurst::flush_if_due`]. If it returns [`FlushResult::Typed`], insert
 //!   that char as normal typing. If it returns [`FlushResult::Paste`], treat the returned string as
 //!   an explicit paste.
-//! - Before applying non-char input (arrow keys, Ctrl/Alt modifiers, etc.), use
+//! - Before applying non-text input (arrow keys; Ctrl/Alt shortcuts other than Windows AltGr;
+//!   or Super, Hyper, and Meta modifiers), use
 //!   [`PasteBurst::flush_before_modified_input`] to avoid leaving buffered text "stuck", and then
 //!   [`PasteBurst::clear_window_after_non_char`] so subsequent typing does not get grouped into a
 //!   previous burst.
+//! - Direct-insert callers can skip buffering, use
+//!   [`PasteBurst::direct_insert_newline_should_insert`] in their Enter handler, and call
+//!   [`PasteBurst::extend_window`] when Enter or [`PasteBurst::on_plain_char_no_hold`] reports a
+//!   burst-like stream.
 //!
 //! # State Variables
 //!
@@ -109,10 +112,10 @@
 //! - [`PasteBurst::on_plain_char_no_hold`] never holds (used for IME/non-ASCII paths), since
 //!   holding a non-ASCII character can feel like dropped input.
 //!
-//! # Contract With `ChatComposer`
+//! # Contract With Callers
 //!
-//! `PasteBurst` does not mutate the UI text buffer on its own. The caller (`ChatComposer`) must
-//! interpret decisions and apply the corresponding UI edits:
+//! `PasteBurst` does not mutate the UI text buffer on its own. Callers must interpret decisions
+//! and apply the corresponding UI edits. `ChatComposer` uses the full buffering contract:
 //!
 //! - For each plain ASCII `KeyCode::Char`, call [`PasteBurst::on_plain_char`].
 //!   - [`CharDecision::RetainFirstChar`]: do **not** insert the char into the textarea yet.
@@ -141,7 +144,8 @@
 //!   - [`FlushResult::Typed`]: insert that single char as normal typing.
 //!   - [`FlushResult::Paste`]: treat the returned string as an explicit paste.
 //!
-//! - When a non-plain key is pressed (Ctrl/Alt-modified input, arrows, etc.), callers should use
+//! - When non-text input is pressed (Ctrl/Alt shortcuts other than Windows AltGr; Super, Hyper,
+//!   and Meta modifiers; arrows; etc.), callers should use
 //!   [`PasteBurst::clear_window_after_non_char`] to prevent the next keystroke from being
 //!   incorrectly grouped into a previous burst.
 
@@ -334,6 +338,14 @@ impl PasteBurst {
     pub fn newline_should_insert_instead_of_submit(&self, now: Instant) -> bool {
         let in_burst_window = self.burst_window_until.is_some_and(|until| now <= until);
         self.is_active() || in_burst_window
+    }
+
+    /// Decide if Enter should insert a newline for callers that insert chars immediately.
+    pub fn direct_insert_newline_should_insert(&self, now: Instant) -> bool {
+        self.newline_should_insert_instead_of_submit(now)
+            || self
+                .last_plain_char_time
+                .is_some_and(|t| now.duration_since(t) <= PASTE_BURST_CHAR_INTERVAL)
     }
 
     /// Keep the burst window alive.

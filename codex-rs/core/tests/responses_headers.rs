@@ -4,7 +4,9 @@ use std::sync::Arc;
 use codex_core::ModelClient;
 use codex_core::Prompt;
 use codex_core::ResponseEvent;
+use codex_features::Feature;
 use codex_login::CodexAuth;
+use codex_login::auth::AgentIdentityAuthPolicy;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::WireApi;
 use codex_otel::SessionTelemetry;
@@ -15,8 +17,10 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
+use core_test_support::TestCodexResponsesRequestKind;
 use core_test_support::load_default_config_for_test;
 use core_test_support::responses;
+use core_test_support::responses_metadata as test_responses_metadata;
 use core_test_support::test_codex::test_codex;
 use futures::StreamExt;
 use pretty_assertions::assert_eq;
@@ -32,6 +36,23 @@ fn normalize_git_remote_url(url: &str) -> String {
 }
 
 const TEST_INSTALLATION_ID: &str = "11111111-1111-4111-8111-111111111111";
+fn test_turn_responses_metadata(
+    _client: &ModelClient,
+    thread_id: ThreadId,
+    session_source: &SessionSource,
+) -> codex_core::CodexResponsesMetadata {
+    let thread_id = thread_id.to_string();
+    test_responses_metadata(
+        TEST_INSTALLATION_ID,
+        &thread_id,
+        &thread_id,
+        /*turn_id*/ None,
+        format!("{thread_id}:0"),
+        session_source,
+        /*parent_thread_id*/ None,
+        TestCodexResponsesRequestKind::Turn,
+    )
+}
 
 #[tokio::test]
 async fn responses_stream_includes_subagent_header_on_review() {
@@ -68,13 +89,14 @@ async fn responses_stream_includes_subagent_header_on_review() {
         websocket_connect_timeout_ms: None,
         requires_openai_auth: false,
         supports_websockets: false,
+        supports_standalone_web_search: false,
     };
 
     let codex_home = TempDir::new().expect("failed to create TempDir");
     let mut config = load_default_config_for_test(&codex_home).await;
     config.model_provider_id = provider.name.clone();
     config.model_provider = provider.clone();
-    let effort = config.model_reasoning_effort;
+    let effort = config.model_reasoning_effort.clone();
     let summary = config.model_reasoning_summary;
     let model = codex_core::test_support::get_model_offline(config.model.as_deref());
     config.model = Some(model.clone());
@@ -85,6 +107,7 @@ async fn responses_stream_includes_subagent_header_on_review() {
     let session_source = SessionSource::SubAgent(SubAgentSource::Review);
     let model_info =
         codex_core::test_support::construct_model_info_offline(model.as_str(), &config);
+    let expected_window_id = format!("{thread_id}:0");
     let session_telemetry = SessionTelemetry::new(
         thread_id,
         model.as_str(),
@@ -100,17 +123,21 @@ async fn responses_stream_includes_subagent_header_on_review() {
 
     let client = ModelClient::new(
         /*auth_manager*/ None,
-        thread_id.into(),
+        AgentIdentityAuthPolicy::JwtOnly,
         thread_id,
-        /*installation_id*/ TEST_INSTALLATION_ID.to_string(),
         provider.clone(),
-        session_source,
+        session_source.clone(),
+        "test_originator".to_string(),
         config.model_verbosity,
+        config.features.enabled(Feature::ContentItemKinds),
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
+        /*concurrent_reasoning_summaries_enabled*/ false,
         /*attestation_provider*/ None,
+        config.http_client_factory(),
     );
+    let responses_metadata = test_turn_responses_metadata(&client, thread_id, &session_source);
     let mut client_session = client.new_session();
 
     let mut prompt = Prompt::default();
@@ -121,6 +148,7 @@ async fn responses_stream_includes_subagent_header_on_review() {
             text: "hello".into(),
         }],
         phase: None,
+        internal_chat_message_metadata_passthrough: None,
     }];
 
     let mut stream = client_session
@@ -131,7 +159,7 @@ async fn responses_stream_includes_subagent_header_on_review() {
             effort,
             summary.unwrap_or(model_info.default_reasoning_summary),
             /*service_tier*/ None,
-            /*turn_metadata_header*/ None,
+            &responses_metadata,
             &codex_rollout_trace::InferenceTraceContext::disabled(),
         )
         .await
@@ -143,7 +171,6 @@ async fn responses_stream_includes_subagent_header_on_review() {
     }
 
     let request = request_recorder.single_request();
-    let expected_window_id = format!("{thread_id}:0");
     assert_eq!(
         request.header("x-openai-subagent").as_deref(),
         Some("review")
@@ -156,6 +183,10 @@ async fn responses_stream_includes_subagent_header_on_review() {
     assert_eq!(
         request.body_json()["client_metadata"]["x-codex-installation-id"].as_str(),
         Some(TEST_INSTALLATION_ID)
+    );
+    assert_eq!(
+        request.body_json()["client_metadata"]["x-codex-window-id"].as_str(),
+        Some(expected_window_id.as_str())
     );
     assert_eq!(request.header("x-codex-sandbox"), None);
 }
@@ -195,13 +226,14 @@ async fn responses_stream_includes_subagent_header_on_other() {
         websocket_connect_timeout_ms: None,
         requires_openai_auth: false,
         supports_websockets: false,
+        supports_standalone_web_search: false,
     };
 
     let codex_home = TempDir::new().expect("failed to create TempDir");
     let mut config = load_default_config_for_test(&codex_home).await;
     config.model_provider_id = provider.name.clone();
     config.model_provider = provider.clone();
-    let effort = config.model_reasoning_effort;
+    let effort = config.model_reasoning_effort.clone();
     let summary = config.model_reasoning_summary;
     let model = codex_core::test_support::get_model_offline(config.model.as_deref());
     config.model = Some(model.clone());
@@ -228,17 +260,21 @@ async fn responses_stream_includes_subagent_header_on_other() {
 
     let client = ModelClient::new(
         /*auth_manager*/ None,
-        thread_id.into(),
+        AgentIdentityAuthPolicy::JwtOnly,
         thread_id,
-        /*installation_id*/ TEST_INSTALLATION_ID.to_string(),
         provider.clone(),
-        session_source,
+        session_source.clone(),
+        "test_originator".to_string(),
         config.model_verbosity,
+        config.features.enabled(Feature::ContentItemKinds),
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
+        /*concurrent_reasoning_summaries_enabled*/ false,
         /*attestation_provider*/ None,
+        config.http_client_factory(),
     );
+    let responses_metadata = test_turn_responses_metadata(&client, thread_id, &session_source);
     let mut client_session = client.new_session();
 
     let mut prompt = Prompt::default();
@@ -249,6 +285,7 @@ async fn responses_stream_includes_subagent_header_on_other() {
             text: "hello".into(),
         }],
         phase: None,
+        internal_chat_message_metadata_passthrough: None,
     }];
 
     let mut stream = client_session
@@ -259,7 +296,7 @@ async fn responses_stream_includes_subagent_header_on_other() {
             effort,
             summary.unwrap_or(model_info.default_reasoning_summary),
             /*service_tier*/ None,
-            /*turn_metadata_header*/ None,
+            &responses_metadata,
             &codex_rollout_trace::InferenceTraceContext::disabled(),
         )
         .await
@@ -307,6 +344,7 @@ async fn responses_respects_model_info_overrides_from_config() {
         websocket_connect_timeout_ms: None,
         requires_openai_auth: false,
         supports_websockets: false,
+        supports_standalone_web_search: false,
     };
 
     let codex_home = TempDir::new().expect("failed to create TempDir");
@@ -314,9 +352,8 @@ async fn responses_respects_model_info_overrides_from_config() {
     config.model = Some("gpt-3.5-turbo".to_string());
     config.model_provider_id = provider.name.clone();
     config.model_provider = provider.clone();
-    config.model_supports_reasoning_summaries = Some(true);
     config.model_reasoning_summary = Some(ReasoningSummary::Detailed);
-    let effort = config.model_reasoning_effort;
+    let effort = config.model_reasoning_effort.clone();
     let summary = config.model_reasoning_summary;
     let model = config.model.clone().expect("model configured");
     let config = Arc::new(config);
@@ -345,17 +382,21 @@ async fn responses_respects_model_info_overrides_from_config() {
 
     let client = ModelClient::new(
         /*auth_manager*/ None,
-        thread_id.into(),
+        AgentIdentityAuthPolicy::JwtOnly,
         thread_id,
-        /*installation_id*/ TEST_INSTALLATION_ID.to_string(),
         provider.clone(),
-        session_source,
+        session_source.clone(),
+        "test_originator".to_string(),
         config.model_verbosity,
+        config.features.enabled(Feature::ContentItemKinds),
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
+        /*concurrent_reasoning_summaries_enabled*/ false,
         /*attestation_provider*/ None,
+        config.http_client_factory(),
     );
+    let responses_metadata = test_turn_responses_metadata(&client, thread_id, &session_source);
     let mut client_session = client.new_session();
 
     let mut prompt = Prompt::default();
@@ -366,6 +407,7 @@ async fn responses_respects_model_info_overrides_from_config() {
             text: "hello".into(),
         }],
         phase: None,
+        internal_chat_message_metadata_passthrough: None,
     }];
 
     let mut stream = client_session
@@ -376,7 +418,7 @@ async fn responses_respects_model_info_overrides_from_config() {
             effort,
             summary.unwrap_or(model_info.default_reasoning_summary),
             /*service_tier*/ None,
-            /*turn_metadata_header*/ None,
+            &responses_metadata,
             &codex_rollout_trace::InferenceTraceContext::disabled(),
         )
         .await
@@ -425,8 +467,8 @@ async fn responses_stream_includes_turn_metadata_header_for_git_workspace_e2e() 
     test.submit_turn("hello")
         .await
         .expect("submit first turn prompt");
-    let initial_header = first_request
-        .single_request()
+    let initial_request = first_request.single_request();
+    let initial_header = initial_request
         .header("x-codex-turn-metadata")
         .expect("x-codex-turn-metadata header should be present");
     let initial_parsed: serde_json::Value =
@@ -453,6 +495,24 @@ async fn responses_stream_includes_turn_metadata_header_for_git_workspace_e2e() 
             .get("sandbox")
             .and_then(serde_json::Value::as_str),
         Some("none")
+    );
+    assert_eq!(
+        initial_parsed
+            .get("sandbox_mode")
+            .and_then(serde_json::Value::as_str),
+        Some("danger-full-access")
+    );
+    let body_metadata: serde_json::Value = serde_json::from_str(
+        initial_request.body_json()["client_metadata"]["x-codex-turn-metadata"]
+            .as_str()
+            .expect("request body should include x-codex-turn-metadata"),
+    )
+    .expect("body x-codex-turn-metadata should be valid JSON");
+    assert_eq!(
+        body_metadata
+            .get("sandbox_mode")
+            .and_then(serde_json::Value::as_str),
+        Some("danger-full-access")
     );
     assert_eq!(
         initial_parsed
@@ -506,7 +566,7 @@ async fn responses_stream_includes_turn_metadata_header_for_git_workspace_e2e() 
     let first_response = responses::sse(vec![
         responses::ev_response_created("resp-2"),
         responses::ev_reasoning_item("rsn-1", &["thinking"], &[]),
-        responses::ev_shell_command_call("call-1", "echo turn-metadata"),
+        responses::ev_exec_command_call("call-1", "echo turn-metadata"),
         responses::ev_completed("resp-2"),
     ]);
     let follow_up_response = responses::sse(vec![
@@ -625,4 +685,97 @@ async fn responses_stream_includes_turn_metadata_header_for_git_workspace_e2e() 
             .and_then(serde_json::Value::as_bool),
         Some(false)
     );
+}
+
+/// Credential-bearing Git remotes must be redacted from both metadata transports.
+#[tokio::test]
+async fn responses_stream_redacts_git_remote_credentials_from_turn_metadata() {
+    core_test_support::skip_if_no_network!();
+
+    let server = responses::start_mock_server().await;
+    let test = test_codex()
+        .with_model("test-gpt-5.1-codex")
+        .build(&server)
+        .await
+        .expect("build test codex");
+    let cwd = test.cwd_path();
+    let remote_token = "test-git-secret-token";
+    let credential_bearing_origin =
+        "https://alice:test-git-secret-token@example.invalid/openai/codex.git";
+
+    for args in [
+        ["init"].as_slice(),
+        ["remote", "add", "origin", credential_bearing_origin].as_slice(),
+    ] {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("git command should run");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let first_response = responses::sse(vec![
+        responses::ev_response_created("resp-1"),
+        responses::ev_function_call(
+            "wait-for-git",
+            "test_sync_tool",
+            r#"{"wait_for_git_enrichment":true}"#,
+        ),
+        responses::ev_completed("resp-1"),
+    ]);
+    let follow_up_response = responses::sse(vec![
+        responses::ev_response_created("resp-2"),
+        responses::ev_assistant_message("msg-1", "done"),
+        responses::ev_completed("resp-2"),
+    ]);
+    let request_log = responses::mount_response_sequence(
+        &server,
+        vec![
+            responses::sse_response(first_response),
+            responses::sse_response(follow_up_response),
+        ],
+    )
+    .await;
+
+    test.submit_turn("inspect the workspace")
+        .await
+        .expect("submit turn prompt");
+
+    let requests = request_log.requests();
+    assert_eq!(requests.len(), 2, "expected a follow-up model request");
+    let header_metadata = requests[1]
+        .header("x-codex-turn-metadata")
+        .expect("request header should include turn metadata");
+    let request_body = requests[1].body_json();
+    let body_metadata = request_body["client_metadata"]["x-codex-turn-metadata"]
+        .as_str()
+        .expect("request body should include turn metadata");
+
+    for (location, metadata) in [
+        ("request header", header_metadata.as_str()),
+        ("request body", body_metadata),
+    ] {
+        assert!(
+            !metadata.contains(remote_token),
+            "{location} should not expose git remote credentials"
+        );
+        let metadata: serde_json::Value =
+            serde_json::from_str(metadata).expect("turn metadata should be valid JSON");
+        let remotes = metadata
+            .get("workspaces")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|workspaces| workspaces.values().next())
+            .and_then(|workspace| workspace.get("associated_remote_urls"))
+            .expect("turn metadata should include git remote URLs");
+        assert_eq!(
+            remotes,
+            &serde_json::json!({ "origin": "https://example.invalid/openai/codex.git" }),
+            "{location} should contain the sanitized remote"
+        );
+    }
 }

@@ -1,6 +1,8 @@
-//! Helpers for truncating tool and exec output using [`TruncationPolicy`](codex_protocol::protocol::TruncationPolicy).
+//! Shared byte/token truncation for tool and exec output.
 
+use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputContentItem;
+use codex_protocol::models::FunctionCallOutputPayload;
 pub use codex_utils_string::approx_bytes_for_tokens;
 pub use codex_utils_string::approx_token_count;
 pub use codex_utils_string::approx_tokens_from_byte_count;
@@ -14,15 +16,36 @@ pub fn formatted_truncate_text(content: &str, policy: TruncationPolicy) -> Strin
         return content.to_string();
     }
 
+    let original_token_count = approx_token_count(content);
     let total_lines = content.lines().count();
     let result = truncate_text(content, policy);
-    format!("Total output lines: {total_lines}\n\n{result}")
+    format!(
+        "Warning: truncated output (original token count: {original_token_count})\nTotal output lines: {total_lines}\n\n{result}"
+    )
 }
 
 pub fn truncate_text(content: &str, policy: TruncationPolicy) -> String {
     match policy {
         TruncationPolicy::Bytes(bytes) => truncate_middle_chars(content, bytes),
         TruncationPolicy::Tokens(tokens) => truncate_middle_with_token_budget(content, tokens).0,
+    }
+}
+
+/// Applies the existing byte/token budget without changing success metadata or media ordering.
+pub fn truncate_function_output_payload(
+    output: &mut FunctionCallOutputPayload,
+    policy: TruncationPolicy,
+    estimate_audio_token_count: impl Fn(&str) -> usize,
+) {
+    match &mut output.body {
+        FunctionCallOutputBody::Text(text) => *text = truncate_text(text, policy),
+        FunctionCallOutputBody::ContentItems(items) => {
+            *items = truncate_function_output_items_with_policy(
+                items,
+                policy,
+                estimate_audio_token_count,
+            );
+        }
     }
 }
 
@@ -34,7 +57,9 @@ pub fn formatted_truncate_text_content_items_with_policy(
         .iter()
         .filter_map(|item| match item {
             FunctionCallOutputContentItem::InputText { text } => Some(text.as_str()),
-            FunctionCallOutputContentItem::InputImage { .. } => None,
+            FunctionCallOutputContentItem::InputImage { .. }
+            | FunctionCallOutputContentItem::InputAudio { .. }
+            | FunctionCallOutputContentItem::EncryptedContent { .. } => None,
         })
         .collect::<Vec<_>>();
 
@@ -54,6 +79,7 @@ pub fn formatted_truncate_text_content_items_with_policy(
         return (items.to_vec(), None);
     }
 
+    let original_token_count = approx_token_count(&combined);
     let mut out = vec![FunctionCallOutputContentItem::InputText {
         text: formatted_truncate_text(&combined, policy),
     }];
@@ -64,15 +90,26 @@ pub fn formatted_truncate_text_content_items_with_policy(
                 detail: *detail,
             })
         }
+        FunctionCallOutputContentItem::InputAudio { audio_url } => {
+            Some(FunctionCallOutputContentItem::InputAudio {
+                audio_url: audio_url.clone(),
+            })
+        }
+        FunctionCallOutputContentItem::EncryptedContent { encrypted_content } => {
+            Some(FunctionCallOutputContentItem::EncryptedContent {
+                encrypted_content: encrypted_content.clone(),
+            })
+        }
         FunctionCallOutputContentItem::InputText { .. } => None,
     }));
 
-    (out, Some(approx_token_count(&combined)))
+    (out, Some(original_token_count))
 }
 
 pub fn truncate_function_output_items_with_policy(
     items: &[FunctionCallOutputContentItem],
     policy: TruncationPolicy,
+    estimate_audio_token_count: impl Fn(&str) -> usize,
 ) -> Vec<FunctionCallOutputContentItem> {
     let mut out: Vec<FunctionCallOutputContentItem> = Vec::with_capacity(items.len());
     let mut remaining_budget = match policy {
@@ -80,10 +117,15 @@ pub fn truncate_function_output_items_with_policy(
         TruncationPolicy::Tokens(_) => policy.token_budget(),
     };
     let mut omitted_text_items = 0usize;
+    let mut omitted_audio_items = 0usize;
 
     for item in items {
         match item {
             FunctionCallOutputContentItem::InputText { text } => {
+                // Empty text contributes no model content but still consumes an API array slot.
+                if text.is_empty() {
+                    continue;
+                }
                 if remaining_budget == 0 {
                     omitted_text_items += 1;
                     continue;
@@ -117,12 +159,37 @@ pub fn truncate_function_output_items_with_policy(
                     detail: *detail,
                 });
             }
+            FunctionCallOutputContentItem::InputAudio { audio_url } => {
+                let token_cost = estimate_audio_token_count(audio_url);
+                let cost = match policy {
+                    TruncationPolicy::Bytes(_) => approx_bytes_for_tokens(token_cost),
+                    TruncationPolicy::Tokens(_) => token_cost,
+                };
+                if cost <= remaining_budget {
+                    out.push(FunctionCallOutputContentItem::InputAudio {
+                        audio_url: audio_url.clone(),
+                    });
+                    remaining_budget = remaining_budget.saturating_sub(cost);
+                } else {
+                    omitted_audio_items += 1;
+                }
+            }
+            FunctionCallOutputContentItem::EncryptedContent { encrypted_content } => {
+                out.push(FunctionCallOutputContentItem::EncryptedContent {
+                    encrypted_content: encrypted_content.clone(),
+                });
+            }
         }
     }
 
     if omitted_text_items > 0 {
         out.push(FunctionCallOutputContentItem::InputText {
             text: format!("[omitted {omitted_text_items} text items ...]"),
+        });
+    }
+    if omitted_audio_items > 0 {
+        out.push(FunctionCallOutputContentItem::InputText {
+            text: format!("[omitted {omitted_audio_items} audio items ...]"),
         });
     }
 

@@ -70,7 +70,7 @@ pub(crate) fn render_mcp_tool_approval_template(
 
 fn load_consequential_tool_message_templates() -> Option<Vec<ConsequentialToolMessageTemplate>> {
     let templates = match serde_json::from_str::<ConsequentialToolMessageTemplatesFile>(
-        include_str!("consequential_tool_message_templates.json"),
+        include_str!("../assets/consequential_tool_message_templates.json"),
     ) {
         Ok(templates) => templates,
         Err(err) => {
@@ -170,7 +170,7 @@ fn render_tool_params(
         .iter()
         .filter(|(name, _)| !handled_names.contains(name.as_str()))
         .collect::<Vec<_>>();
-    remaining_params.sort_by(|(left_name, _), (right_name, _)| left_name.cmp(right_name));
+    remaining_params.sort_by_key(|(name, _)| *name);
 
     for (name, value) in remaining_params {
         if handled_names.contains(name.as_str()) {

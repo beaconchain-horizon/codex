@@ -76,7 +76,6 @@ signal to remove stale memories derived only from those resources.
 }
 
 mod stage_one {
-    pub(super) const MODEL: &str = "gpt-5.4-mini";
     pub(super) const REASONING_EFFORT: codex_protocol::openai_models::ReasoningEffort =
         codex_protocol::openai_models::ReasoningEffort::Low;
     pub(super) const CONCURRENCY_LIMIT: usize = 8;
@@ -101,7 +100,6 @@ mod stage_one {
 }
 
 mod stage_two {
-    pub(super) const MODEL: &str = "gpt-5.4";
     pub(super) const REASONING_EFFORT: codex_protocol::openai_models::ReasoningEffort =
         codex_protocol::openai_models::ReasoningEffort::Medium;
     pub(super) const JOB_LEASE_SECONDS: i64 = 3_600;
@@ -132,5 +130,18 @@ pub fn raw_memories_file(root: &Path) -> PathBuf {
 }
 
 pub async fn ensure_layout(root: &Path) -> std::io::Result<()> {
+    tokio::fs::create_dir_all(root).await?;
+    if tokio::fs::symlink_metadata(root)
+        .await?
+        .file_type()
+        .is_symlink()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("memory root cannot be a symbolic link: {}", root.display()),
+        ));
+    }
+
+    workspace::remove_memory_symlinks(root).await?;
     tokio::fs::create_dir_all(rollout_summaries_dir(root)).await
 }

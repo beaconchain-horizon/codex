@@ -1,4 +1,5 @@
 use codex_app_server_protocol::HookEventName;
+use codex_app_server_protocol::HookHandlerMetadata;
 use codex_app_server_protocol::HookMetadata;
 use codex_app_server_protocol::HookSource;
 use codex_app_server_protocol::HookTrustStatus;
@@ -29,6 +30,9 @@ use crate::app_event_sender::AppEventSender;
 use crate::hooks_rpc::HookTrustUpdate;
 use crate::hooks_rpc::hook_needs_review;
 use crate::key_hint;
+use crate::key_hint::KeyBindingListExt;
+use crate::keymap::ListAction;
+use crate::keymap::ListKeymap;
 use crate::line_truncation::truncate_line_with_ellipsis_if_overflow;
 use crate::render::renderable::Renderable;
 use crate::status::format_directory_display;
@@ -50,6 +54,7 @@ pub(crate) struct HooksBrowserView {
     state: ScrollState,
     complete: bool,
     app_event_tx: AppEventSender,
+    keymap: ListKeymap,
 }
 
 impl HooksBrowserView {
@@ -68,10 +73,15 @@ impl HooksBrowserView {
                 errors,
             },
             app_event_tx,
+            crate::keymap::RuntimeKeymap::defaults().list,
         )
     }
 
-    pub(crate) fn from_entry(mut entry: HooksListEntry, app_event_tx: AppEventSender) -> Self {
+    pub(crate) fn from_entry(
+        mut entry: HooksListEntry,
+        app_event_tx: AppEventSender,
+        keymap: ListKeymap,
+    ) -> Self {
         entry.hooks.sort_by_key(|hook| hook.display_order);
         let mut view = Self {
             entry,
@@ -79,6 +89,7 @@ impl HooksBrowserView {
             state: ScrollState::new(),
             complete: false,
             app_event_tx,
+            keymap,
         };
         if view.page_len() > 0 {
             view.state.selected_idx = Some(
@@ -163,6 +174,26 @@ impl HooksBrowserView {
         let len = self.page_len();
         self.state.move_down_wrap(len);
         self.state.ensure_visible(len, self.max_visible_rows());
+    }
+
+    fn page_up(&mut self) {
+        let len = self.page_len();
+        self.state.page_up_clamped(len, self.max_visible_rows());
+    }
+
+    fn page_down(&mut self) {
+        let len = self.page_len();
+        self.state.page_down_clamped(len, self.max_visible_rows());
+    }
+
+    fn jump_top(&mut self) {
+        let len = self.page_len();
+        self.state.jump_top(len, self.max_visible_rows());
+    }
+
+    fn jump_bottom(&mut self) {
+        let len = self.page_len();
+        self.state.jump_bottom(len, self.max_visible_rows());
     }
 
     fn page_len(&self) -> usize {
@@ -456,13 +487,43 @@ impl HooksBrowserView {
             width,
             /*max_lines*/ None,
         ));
-        lines.extend(detail_wrapped_lines(
-            "Command",
-            hook.command.as_deref().unwrap_or("-"),
-            width,
-            Some(MAX_COMMAND_DETAIL_LINES),
-        ));
+        match &hook.handler {
+            HookHandlerMetadata::Command { command, r#async } => {
+                lines.extend(detail_wrapped_lines(
+                    "Command",
+                    command,
+                    width,
+                    Some(MAX_COMMAND_DETAIL_LINES),
+                ));
+                lines.push(detail_line("Mode", if *r#async { "Async" } else { "Sync" }));
+            }
+            HookHandlerMetadata::McpTool { server, tool } => {
+                lines.extend(detail_wrapped_lines(
+                    "MCP Server",
+                    server,
+                    width,
+                    /*max_lines*/ None,
+                ));
+                lines.extend(detail_wrapped_lines(
+                    "MCP Tool", tool, width, /*max_lines*/ None,
+                ));
+            }
+            HookHandlerMetadata::Prompt {} => {
+                lines.push(detail_line("Handler", "Prompt"));
+            }
+            HookHandlerMetadata::Agent {} => {
+                lines.push(detail_line("Handler", "Agent"));
+            }
+        }
         lines.push(detail_line("Timeout", &format!("{}s", hook.timeout_sec)));
+        if let Some(limit) = hook.additional_context_limit {
+            let value = if limit == 0 {
+                "unlimited".to_string()
+            } else {
+                format!("limit: {limit} approximate tokens")
+            };
+            lines.push(detail_line("Context", &value));
+        }
         lines.push(detail_line("Trust", hook_trust_label(hook.trust_status)));
         lines
     }
@@ -474,35 +535,40 @@ impl HooksBrowserView {
             width: area.width.saturating_sub(2),
             height: area.height,
         };
+        let accept = self.keymap.primary_hint(ListAction::Accept);
+        let cancel = self
+            .keymap
+            .primary_hint(ListAction::Cancel)
+            .unwrap_or_else(|| key_hint::plain(KeyCode::Esc).into());
         let footer = match self.page {
-            HooksBrowserPage::Events if self.review_needed_total_count() > 0 => Line::from(vec![
-                "Press ".into(),
-                key_hint::plain(KeyCode::Char('t')).into(),
-                " to trust all; ".into(),
-                key_hint::plain(KeyCode::Enter).into(),
-                " to review hooks; ".into(),
-                key_hint::plain(KeyCode::Esc).into(),
-                " to close".into(),
-            ]),
-            HooksBrowserPage::Events => Line::from(vec![
-                "Press ".into(),
-                key_hint::plain(KeyCode::Enter).into(),
-                " to view hooks; ".into(),
-                key_hint::plain(KeyCode::Esc).into(),
-                " to close".into(),
-            ]),
+            HooksBrowserPage::Events if self.review_needed_total_count() > 0 => {
+                let mut spans = vec![
+                    "Press ".into(),
+                    key_hint::plain(KeyCode::Char('t')).into(),
+                    " to trust all; ".into(),
+                ];
+                if let Some(accept) = accept {
+                    spans.extend([accept.into(), " to review hooks; ".into()]);
+                }
+                spans.extend([cancel.into(), " to close".into()]);
+                Line::from(spans)
+            }
+            HooksBrowserPage::Events => {
+                let mut spans = vec!["Press ".into()];
+                if let Some(accept) = accept {
+                    spans.extend([accept.into(), " to view hooks; ".into()]);
+                }
+                spans.extend([cancel.into(), " to close".into()]);
+                Line::from(spans)
+            }
             HooksBrowserPage::Handlers(event_name) => {
                 let selected_hook = self.selected_hook(event_name);
                 if selected_hook.is_none() {
-                    Line::from(vec![
-                        "Press ".into(),
-                        key_hint::plain(KeyCode::Esc).into(),
-                        " to go back".into(),
-                    ])
+                    Line::from(vec!["Press ".into(), cancel.into(), " to go back".into()])
                 } else if selected_hook.is_some_and(|hook| hook.is_managed) {
                     Line::from(vec![
                         "Managed hooks are always on; press ".into(),
-                        key_hint::plain(KeyCode::Esc).into(),
+                        cancel.into(),
                         " to go back".into(),
                     ])
                 } else if selected_hook.is_some_and(hook_needs_review) {
@@ -510,19 +576,17 @@ impl HooksBrowserView {
                         "Press ".into(),
                         key_hint::plain(KeyCode::Char('t')).into(),
                         " to trust; ".into(),
-                        key_hint::plain(KeyCode::Esc).into(),
+                        cancel.into(),
                         " to go back".into(),
                     ])
                 } else {
-                    Line::from(vec![
-                        "Press ".into(),
-                        key_hint::plain(KeyCode::Char(' ')).into(),
-                        " or ".into(),
-                        key_hint::plain(KeyCode::Enter).into(),
-                        " to toggle; ".into(),
-                        key_hint::plain(KeyCode::Esc).into(),
-                        " to go back".into(),
-                    ])
+                    let mut spans =
+                        vec!["Press ".into(), key_hint::plain(KeyCode::Char(' ')).into()];
+                    if let Some(accept) = accept {
+                        spans.extend([" or ".into(), accept.into()]);
+                    }
+                    spans.extend([" to toggle; ".into(), cancel.into(), " to go back".into()]);
+                    Line::from(spans)
                 }
             }
         };
@@ -531,35 +595,24 @@ impl HooksBrowserView {
 }
 
 impl BottomPaneView for HooksBrowserView {
+    fn keymap_contexts(&self) -> crate::keymap::KeymapContextSet {
+        crate::keymap::KeymapContextSet::new(crate::keymap::KeymapContext::List)
+    }
+
     fn handle_key_event(&mut self, key_event: KeyEvent) {
         match key_event {
-            KeyEvent {
-                code: KeyCode::Up, ..
+            _ if self.keymap.move_up.is_pressed(key_event) => self.move_up(),
+            _ if self.keymap.move_down.is_pressed(key_event) => self.move_down(),
+            _ if self.keymap.page_up.is_pressed(key_event) => self.page_up(),
+            _ if self.keymap.page_down.is_pressed(key_event) => self.page_down(),
+            _ if self.keymap.jump_top.is_pressed(key_event) => self.jump_top(),
+            _ if self.keymap.jump_bottom.is_pressed(key_event) => self.jump_bottom(),
+            _ if self.keymap.accept.is_pressed(key_event)
+                && self.page == HooksBrowserPage::Events =>
+            {
+                self.open_selected_event()
             }
-            | KeyEvent {
-                code: KeyCode::Char('p'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } => self.move_up(),
-            KeyEvent {
-                code: KeyCode::Down,
-                ..
-            }
-            | KeyEvent {
-                code: KeyCode::Char('n'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } => self.move_down(),
-            KeyEvent {
-                code: KeyCode::Enter,
-                modifiers: KeyModifiers::NONE,
-                ..
-            } if self.page == HooksBrowserPage::Events => self.open_selected_event(),
-            KeyEvent {
-                code: KeyCode::Enter,
-                modifiers: KeyModifiers::NONE,
-                ..
-            } => {
+            _ if self.keymap.accept.is_pressed(key_event) => {
                 if let HooksBrowserPage::Handlers(event_name) = self.page {
                     self.toggle_selected_hook(event_name);
                 }
@@ -581,9 +634,7 @@ impl BottomPaneView for HooksBrowserView {
                 HooksBrowserPage::Events => self.trust_all_hooks(),
                 HooksBrowserPage::Handlers(event_name) => self.trust_selected_hook(event_name),
             },
-            KeyEvent {
-                code: KeyCode::Esc, ..
-            } => match self.page {
+            _ if self.keymap.cancel.is_pressed(key_event) => match self.page {
                 HooksBrowserPage::Events => self.close(),
                 HooksBrowserPage::Handlers(_) => self.return_to_events(),
             },
@@ -723,8 +774,12 @@ fn event_label(event_name: HookEventName) -> &'static str {
         HookEventName::PreCompact => "PreCompact",
         HookEventName::PostCompact => "PostCompact",
         HookEventName::SessionStart => "SessionStart",
+        HookEventName::SessionEnd => "SessionEnd",
         HookEventName::UserPromptSubmit => "UserPromptSubmit",
+        HookEventName::SubagentStart => "SubagentStart",
+        HookEventName::SubagentStop => "SubagentStop",
         HookEventName::Stop => "Stop",
+        HookEventName::Interrupt => "Interrupt",
     }
 }
 
@@ -736,8 +791,12 @@ fn event_description(event_name: HookEventName) -> &'static str {
         HookEventName::PreCompact => "Before context compaction",
         HookEventName::PostCompact => "After context compaction",
         HookEventName::SessionStart => "When a new session starts",
+        HookEventName::SessionEnd => "Right before a session ends",
         HookEventName::UserPromptSubmit => "When the user submits a prompt",
+        HookEventName::SubagentStart => "When a subagent is created",
+        HookEventName::SubagentStop => "Right before a subagent ends its turn",
         HookEventName::Stop => "Right before Codex ends its turn",
+        HookEventName::Interrupt => "Right before an interrupted turn is aborted",
     }
 }
 
@@ -762,6 +821,7 @@ fn detail_source_value(hook: &HookMetadata) -> String {
         HookSource::System
         | HookSource::Mdm
         | HookSource::CloudRequirements
+        | HookSource::CloudManagedConfig
         | HookSource::LegacyManagedConfigFile
         | HookSource::LegacyManagedConfigMdm => config_source_label(hook.source).to_string(),
         _ => format!(
@@ -781,6 +841,7 @@ fn config_source_label(source: HookSource) -> &'static str {
         HookSource::SessionFlags => "Session flags",
         HookSource::Plugin => unreachable!("plugin hooks are handled by summary_source"),
         HookSource::CloudRequirements => "Admin config",
+        HookSource::CloudManagedConfig => "Cloud-managed config",
         HookSource::LegacyManagedConfigFile => "Admin config",
         HookSource::LegacyManagedConfigMdm => "Admin config",
         HookSource::Unknown => "Unknown source",
@@ -797,13 +858,18 @@ fn detail_wrapped_lines(
     width: usize,
     max_lines: Option<usize>,
 ) -> Vec<Line<'static>> {
-    let prefix = format!("{label:<10}");
+    let label_width = label.width().saturating_add(1).max(10);
+    let prefix = format!("{label:<label_width$}");
     let available = width.saturating_sub(prefix.width()).max(1);
     let mut wrapped = textwrap::wrap(value, available).into_iter();
     let first = wrapped.next().unwrap_or_default().into_owned();
     let mut lines = vec![Line::from(vec![prefix.into(), first.dim()])];
-    lines
-        .extend(wrapped.map(|line| Line::from(vec!["          ".into(), line.into_owned().dim()])));
+    lines.extend(wrapped.map(|line| {
+        Line::from(vec![
+            " ".repeat(label_width).into(),
+            line.into_owned().dim(),
+        ])
+    }));
     let Some(max_lines) = max_lines else {
         return lines;
     };
@@ -847,7 +913,7 @@ mod tests {
     use crate::test_support::test_path_display;
     use codex_app_server_protocol::HookErrorInfo;
     use codex_app_server_protocol::HookEventName;
-    use codex_app_server_protocol::HookHandlerType;
+    use codex_app_server_protocol::HookHandlerMetadata;
     use codex_app_server_protocol::HookMetadata;
     use codex_app_server_protocol::HookSource;
     use codex_app_server_protocol::HookTrustStatus;
@@ -910,12 +976,15 @@ mod tests {
         HookMetadata {
             key: key.to_string(),
             event_name,
-            handler_type: HookHandlerType::Command,
+            handler: HookHandlerMetadata::Command {
+                command: command.to_string(),
+                r#async: false,
+            },
             is_managed,
             matcher: Some("Bash".to_string()),
-            command: Some(command.to_string()),
             timeout_sec: 30,
             status_message: None,
+            additional_context_limit: None,
             source_path: test_path_buf("/tmp/hooks.json").abs(),
             source,
             plugin_id: plugin_id.map(str::to_string),
@@ -973,8 +1042,10 @@ mod tests {
 
     #[test]
     fn renders_event_browser() {
-        let view = view();
+        let mut view = view();
         assert_snapshot!("hooks_browser_events", render_lines(&view, /*width*/ 112));
+        view.keymap.accept.clear();
+        assert!(!render_lines(&view, /*width*/ 112).contains("enter to view hooks"));
     }
 
     #[test]
@@ -1061,6 +1132,67 @@ mod tests {
     }
 
     #[test]
+    fn renders_mcp_tool_handler_with_server_and_tool_details() {
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+        let mut configured_hook = hook(
+            "plugin:security-scanner",
+            HookEventName::PreToolUse,
+            HookSource::Plugin,
+            Some("security-tools@openai-curated"),
+            "",
+            /*enabled*/ true,
+            /*is_managed*/ false,
+            /*display_order*/ 0,
+        );
+        configured_hook.handler = HookHandlerMetadata::McpTool {
+            server: "scanner".to_string(),
+            tool: "scan_file".to_string(),
+        };
+        let mut view = HooksBrowserView::new(
+            vec![configured_hook],
+            Vec::new(),
+            Vec::new(),
+            AppEventSender::new(tx_raw),
+        );
+
+        view.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+        assert_snapshot!(
+            "hooks_browser_mcp_tool_handler",
+            render_lines(&view, /*width*/ 112)
+        );
+    }
+
+    #[test]
+    fn renders_handler_additional_context_limit() {
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+        let mut configured_hook = hook(
+            "path:context-limit",
+            HookEventName::PreToolUse,
+            HookSource::User,
+            /*plugin_id*/ None,
+            "/tmp/pre-tool-use.sh",
+            /*enabled*/ true,
+            /*is_managed*/ false,
+            /*display_order*/ 0,
+        );
+        configured_hook.additional_context_limit = Some(0);
+        let mut view = HooksBrowserView::new(
+            vec![configured_hook],
+            Vec::new(),
+            Vec::new(),
+            AppEventSender::new(tx_raw),
+        );
+
+        view.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+        assert_snapshot!(
+            "hooks_browser_additional_context_limit",
+            render_lines(&view, /*width*/ 112)
+        );
+    }
+
+    #[test]
     fn renders_untrusted_enabled_handler_as_inactive() {
         let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
         let mut untrusted_hook = hook(
@@ -1074,6 +1206,10 @@ mod tests {
             /*display_order*/ 0,
         );
         untrusted_hook.trust_status = HookTrustStatus::Untrusted;
+        let HookHandlerMetadata::Command { r#async, .. } = &mut untrusted_hook.handler else {
+            panic!("expected command hook");
+        };
+        *r#async = true;
         let mut view = HooksBrowserView::new(
             vec![untrusted_hook],
             Vec::new(),

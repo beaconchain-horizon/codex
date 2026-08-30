@@ -23,7 +23,7 @@ use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::UserInput;
 use codex_arg0::Arg0DispatchPaths;
-use codex_config::CloudRequirementsLoader;
+use codex_config::CloudConfigBundleLoader;
 use codex_config::LoaderOverrides;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
@@ -234,12 +234,15 @@ async fn build_test_processor(
 ) {
     let (outgoing_tx, outgoing_rx) = mpsc::channel(16);
     let auth_manager =
-        AuthManager::shared_from_config(config.as_ref(), /*enable_codex_api_key_env*/ false).await;
+        AuthManager::shared_from_config(config.as_ref(), /*enable_codex_api_key_env*/ false)
+            .await
+            .expect("test auth manager");
     let config_manager = ConfigManager::new(
         config.codex_home.to_path_buf(),
         Vec::new(),
         LoaderOverrides::default(),
-        CloudRequirementsLoader::default(),
+        /*strict_config*/ false,
+        CloudConfigBundleLoader::default(),
         Arg0DispatchPaths::default(),
         Arc::new(codex_config::NoopThreadConfigLoader),
     );
@@ -263,6 +266,7 @@ async fn build_test_processor(
         session_source: SessionSource::VSCode,
         auth_manager,
         installation_id: "11111111-1111-4111-8111-111111111111".to_string(),
+        code_mode_session_provider: None,
         rpc_transport: AppServerRpcTransport::Stdio,
         remote_control_handle: None,
         plugin_startup_tasks: crate::PluginStartupTasks::Start,
@@ -274,7 +278,7 @@ fn run_current_thread_test_with_stack<F>(name: &str, future: F) -> Result<()>
 where
     F: Future<Output = Result<()>> + Send + 'static,
 {
-    const TEST_STACK_SIZE_BYTES: usize = 4 * 1024 * 1024;
+    const TEST_STACK_SIZE_BYTES: usize = 8 * 1024 * 1024;
 
     let handle = std::thread::Builder::new()
         .name(name.to_string())
@@ -448,8 +452,10 @@ async fn read_response<T: serde::de::DeserializeOwned>(
         if response.id != RequestId::Integer(request_id) {
             continue;
         }
-        return serde_json::from_value(response.result)
-            .expect("response payload should deserialize");
+        return serde_json::from_value(
+            serde_json::to_value(response.result).expect("response payload should serialize"),
+        )
+        .expect("response payload should deserialize");
     }
 }
 
@@ -476,7 +482,7 @@ async fn read_thread_started_notification(
                     continue;
                 };
                 if matches!(
-                    notification,
+                    notification.notification,
                     codex_app_server_protocol::ServerNotification::ThreadStarted(_)
                 ) {
                     return;
@@ -489,7 +495,7 @@ async fn read_thread_started_notification(
                     continue;
                 };
                 if matches!(
-                    notification,
+                    notification.notification,
                     codex_app_server_protocol::ServerNotification::ThreadStarted(_)
                 ) {
                     return;
@@ -652,23 +658,31 @@ async fn turn_start_jsonrpc_span_parents_core_turn_spans() -> Result<()> {
                 params: TurnStartParams {
                     environments: None,
                     thread_id,
+                    client_user_message_id: None,
                     input: vec![UserInput::Text {
                         text: "hello".to_string(),
                         text_elements: Vec::new(),
                     }],
+                    turn_trigger: None,
+                    tool_output: None,
                     responsesapi_client_metadata: None,
+                    additional_context: None,
                     cwd: None,
+                    runtime_workspace_roots: None,
                     approval_policy: None,
                     sandbox_policy: None,
                     permissions: None,
                     approvals_reviewer: None,
                     model: None,
                     service_tier: None,
+                    service_tier_for_turn: None,
                     effort: None,
                     summary: None,
                     personality: None,
                     output_schema: None,
                     collaboration_mode: None,
+                    multi_agent_mode: None,
+                    cyber_access_program: None,
                 },
             },
             Some(remote_trace),
@@ -680,7 +694,7 @@ async fn turn_start_jsonrpc_span_parents_core_turn_spans() -> Result<()> {
                 && span_attr(span, "rpc.method") == Some("turn/start")
                 && span.span_context.trace_id() == remote_trace_id
         }) && spans.iter().any(|span| {
-            span_attr(span, "codex.op") == Some("user_input")
+            span_attr(span, "codex.op") == Some("turn_input")
                 && span.span_context.trace_id() == remote_trace_id
         })
     })
@@ -689,8 +703,8 @@ async fn turn_start_jsonrpc_span_parents_core_turn_spans() -> Result<()> {
     let server_request_span =
         find_rpc_span_with_trace(&spans, SpanKind::Server, "turn/start", remote_trace_id);
     let core_turn_span =
-        find_span_with_trace(&spans, remote_trace_id, "codex.op=user_input", |span| {
-            span_attr(span, "codex.op") == Some("user_input")
+        find_span_with_trace(&spans, remote_trace_id, "codex.op=turn_input", |span| {
+            span_attr(span, "codex.op") == Some("turn_input")
         });
 
     assert_eq!(server_request_span.parent_span_id, remote_parent_span_id);

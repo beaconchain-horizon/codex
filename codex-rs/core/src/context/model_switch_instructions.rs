@@ -1,4 +1,5 @@
 use super::ContextualUserFragment;
+use codex_protocol::models::ContentItemKind;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ModelSwitchInstructions {
@@ -14,9 +15,25 @@ impl ModelSwitchInstructions {
 }
 
 impl ContextualUserFragment for ModelSwitchInstructions {
-    const ROLE: &'static str = "developer";
-    const START_MARKER: &'static str = "<model_switch>";
-    const END_MARKER: &'static str = "</model_switch>";
+    fn content_kind(&self) -> ContentItemKind {
+        ContentItemKind("model_switch.instructions".to_string())
+    }
+
+    fn role(&self) -> &'static str {
+        "developer"
+    }
+
+    fn requires_separate_message(&self) -> bool {
+        true
+    }
+
+    fn markers(&self) -> (&'static str, &'static str) {
+        Self::type_markers()
+    }
+
+    fn type_markers() -> (&'static str, &'static str) {
+        ("<model_switch>", "</model_switch>")
+    }
 
     fn body(&self) -> String {
         format!(

@@ -1,9 +1,9 @@
-use schemars::JsonSchema;
+use crate::JsonSchema;
+use crate::TS;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use ts_rs::TS;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
@@ -14,6 +14,7 @@ pub struct FeedbackUploadParams {
     pub reason: Option<String>,
     #[ts(optional = nullable)]
     pub thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub include_logs: bool,
     #[ts(optional = nullable)]
     pub extra_log_files: Option<Vec<PathBuf>>,

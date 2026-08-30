@@ -1,6 +1,5 @@
 #![cfg(not(debug_assertions))]
 
-use crate::history_cell::padded_emoji;
 use crate::key_hint;
 use crate::legacy_core::config::Config;
 use crate::render::Insets;
@@ -27,6 +26,8 @@ use ratatui::widgets::Clear;
 use ratatui::widgets::WidgetRef;
 use tokio_stream::StreamExt;
 
+const RELEASE_NOTES_URL: &str = "https://github.com/openai/codex/releases/latest";
+
 pub(crate) enum UpdatePromptOutcome {
     Continue,
     RunUpdate(UpdateAction),
@@ -49,15 +50,17 @@ pub(crate) async fn run_update_prompt_if_needed(
         frame.render_widget_ref(&screen, frame.area());
     })?;
 
+    tui.discard_pending_input_before_interactive_screen()?;
     let events = tui.event_stream();
     tokio::pin!(events);
 
     while !screen.is_done() {
         if let Some(event) = events.next().await {
+            tui.screen_size_for_event(&event)?;
             match event {
                 TuiEvent::Key(key_event) => screen.handle_key(key_event),
-                TuiEvent::Paste(_) => {}
-                TuiEvent::Draw | TuiEvent::Resize => {
+                TuiEvent::Paste(_) | TuiEvent::FocusLost => {}
+                TuiEvent::Draw | TuiEvent::Resume | TuiEvent::Resize(_) | TuiEvent::FocusGained => {
                     tui.draw(u16::MAX, |frame| {
                         frame.render_widget_ref(&screen, frame.area());
                     })?;
@@ -190,7 +193,7 @@ impl WidgetRef for &UpdatePromptScreen {
 
         column.push("");
         column.push(Line::from(vec![
-            padded_emoji("  ✨").bold().cyan(),
+            "  ✨\u{200A}".bold().cyan(),
             "Update available!".bold(),
             " ".into(),
             format!(
@@ -204,9 +207,7 @@ impl WidgetRef for &UpdatePromptScreen {
         column.push(
             Line::from(vec![
                 "Release notes: ".dim(),
-                "https://github.com/openai/codex/releases/latest"
-                    .dim()
-                    .underlined(),
+                RELEASE_NOTES_URL.dim().underlined(),
             ])
             .inset(Insets::tlbr(0, 2, 0, 0)),
         );
@@ -236,6 +237,7 @@ impl WidgetRef for &UpdatePromptScreen {
             .inset(Insets::tlbr(0, 2, 0, 0)),
         );
         column.render(area, buf);
+        crate::terminal_hyperlinks::mark_underlined_hyperlink(buf, area, RELEASE_NOTES_URL);
     }
 }
 
@@ -248,6 +250,7 @@ mod tests {
     use crossterm::event::KeyEvent;
     use crossterm::event::KeyModifiers;
     use ratatui::Terminal;
+    use ratatui::widgets::FrameExt;
 
     fn new_prompt() -> UpdatePromptScreen {
         UpdatePromptScreen::new(

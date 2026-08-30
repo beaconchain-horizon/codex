@@ -26,6 +26,7 @@ use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 
+use memchr::memchr_iter;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -36,6 +37,12 @@ use tokio::io::AsyncReadExt;
 use codex_config::types::History;
 use codex_config::types::HistoryPersistence;
 
+mod batch;
+pub use batch::HistoryBatch;
+pub use batch::HistoryBatchCursor;
+pub use batch::HistoryBatchEntry;
+pub use batch::lookup_batch;
+
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 #[cfg(unix)]
@@ -43,6 +50,7 @@ use std::os::unix::fs::PermissionsExt;
 
 /// Filename that stores the message history inside `~/.codex`.
 const HISTORY_FILENAME: &str = "history.jsonl";
+const HISTORY_READ_BUFFER_SIZE: usize = 8192;
 
 /// When history exceeds the hard cap, trim it down to this fraction of `max_bytes`.
 const HISTORY_SOFT_CAP_RATIO: f64 = 0.8;
@@ -330,13 +338,13 @@ async fn history_metadata_for_file(path: &Path) -> (u64, usize) {
     };
 
     // Count newline bytes.
-    let mut buf = [0u8; 8192];
+    let mut buf = [0u8; HISTORY_READ_BUFFER_SIZE];
     let mut count = 0usize;
     loop {
         match file.read(&mut buf).await {
             Ok(0) => break,
             Ok(n) => {
-                count += buf[..n].iter().filter(|&&b| b == b'\n').count();
+                count += memchr_iter(b'\n', &buf[..n]).count();
             }
             Err(_) => return (log_id, 0),
         }
@@ -431,5 +439,8 @@ fn log_identity(_metadata: &std::fs::Metadata) -> Option<u64> {
     None
 }
 
+#[cfg(test)]
+#[path = "batch_tests.rs"]
+mod batch_tests;
 #[cfg(test)]
 mod tests;

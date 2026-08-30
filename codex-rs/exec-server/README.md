@@ -16,21 +16,107 @@ filesystem operations and `codex-linux-sandbox`.
 
 ## Transport
 
-The server speaks the shared `codex-app-server-protocol` message envelope on
-the wire.
+The server speaks the exec-specific `codex-exec-server-protocol` message
+envelope on the wire.
 
 The CLI entrypoint supports:
 
 - `ws://IP:PORT` (default)
-- `--remote URL --executor-id ID [--name NAME]`
+- `--remote URL --environment-id ID [--name NAME]`
+- `forward --connect ws://HOST:PORT --remote URL --environment-id ID`
 
-Remote mode registers the local exec-server with the executor registry,
-then reconnects to the service-provided rendezvous websocket as the executor.
-It requires a bearer token in `CODEX_EXEC_SERVER_REMOTE_BEARER_TOKEN`.
+Remote mode registers the local exec-server with the environment registry,
+then reconnects to the service-provided rendezvous websocket as the environment.
+Remote communication uses the Noise relay contract; the registry and harness
+must support it.
+Forward mode uses the same registration and Noise relay, but opens an independent
+WebSocket connection to the destination exec-server for each authenticated
+harness stream. Complete message payloads pass unchanged in both directions;
+the forwarder does not parse RPCs, initialize sessions, or execute requests.
+The destination owns session IDs, processes, and session resumption.
+Disconnecting either side closes its peer and resets the remote stream. The
+existing harness reconnect flow can then resume a retained destination session.
+The forwarder does not replay requests or persist execution state, so recovery
+is limited by the destination's session and process-output retention.
+It uses the standard Codex ChatGPT sign-in state; run `codex login` first when
+remote registration needs authentication. Containerized callers that receive an
+Agent Identity JWT in `CODEX_ACCESS_TOKEN` can opt into that auth path with
+`--use-agent-identity-auth`; Codex then registers an Agent task and sends the
+derived AgentAssertion headers on the registry request.
+
+Alternatively, API users can instead use `CODEX_API_KEY`;
+Codex sends it as a bearer token on the registration request. For example:
+
+```sh
+CODEX_API_KEY="$OPENAI_API_KEY" \
+codex exec-server \
+  --remote ... \
+  --environment-id "$ENVIRONMENT_ID"
+```
 
 Wire framing:
 
-- websocket: one JSON-RPC message per websocket text frame
+- local websocket: one JSON-RPC message per websocket message
+- Noise remote websocket: binary protobuf relay frames carrying encrypted payloads
+
+## Remote Relay Message Format
+
+In remote mode, the harness and environment communicate through rendezvous using
+`codex.exec_server.relay.v1.RelayMessageFrame`; the checked-in schema is in
+`src/proto/codex.exec_server.relay.v1.proto`. The relay frame carries stream
+identity plus endpoint-owned reliability metadata:
+
+```text
+version
+stream_id
+traceparent       // optional W3C parent on the first frame of a traced request
+tracestate        // optional W3C vendor state paired with traceparent
+body              // handshake | data | ack_frame | resume | reset | heartbeat
+ack               // highest contiguous peer segment seq received
+ack_bits          // bitset for peer segment seqs after ack
+seq               // data only: segment sequence number
+segment_index     // data only: 0-based index within message
+segment_count     // data only: number of segments in message
+payload           // handshake bytes or encrypted data record
+next_seq          // resume only: next sender seq
+reason            // reset only: reset reason
+```
+
+`stream_id` identifies one virtual harness/environment JSON-RPC session on the
+environment websocket. The harness generates a UUIDv4 `stream_id`; the environment
+demuxes frames by `stream_id` and runs an independent `ConnectionProcessor` per
+stream.
+
+Use segment-level sequence numbers for reliability:
+
+```text
+seq = 0, 1, 2, 3, ...
+```
+
+Use contiguous segment sequence ranges to identify and stitch a segmented
+application message:
+
+```text
+message_start_seq = seq - segment_index
+segment_index = 0
+segment_count = 1
+```
+
+`message_start_seq` is derived by the receiver, not sent on the wire. For
+unsplit messages, `message_start_seq == seq`, `segment_index == 0`, and
+`segment_count == 1`.
+
+Use cumulative `ack` plus fixed-size `ack_bits` instead of variable ack ranges:
+
+```text
+ack = highest contiguous received segment seq
+bit i in ack_bits acknowledges seq = ack + 1 + i
+```
+
+Send `ack` and `ack_bits` redundantly on every outbound frame. Acks are not
+themselves acked. Acks, retries, duplicate suppression, segmentation, and
+reassembly are endpoint responsibilities; rendezvous only routes relay frames
+by `stream_id`.
 
 ## Lifecycle
 
@@ -40,6 +126,9 @@ Each connection follows this sequence:
 2. Wait for the `initialize` response.
 3. Send `initialized`.
 4. Call process or filesystem RPCs.
+
+Requests run sequentially by default. Pass `--concurrent-requests <COUNT>` to
+enable concurrent processing.
 
 If the server receives any notification other than `initialized`, it replies
 with an error using request id `-1`.
@@ -64,8 +153,21 @@ Request params:
 Response:
 
 ```json
-{}
+{
+  "sessionId": "00000000-0000-4000-8000-000000000001",
+  "environmentInfo": {
+    "shell": { "name": "bash", "path": "/bin/bash" },
+    "cwd": "file:///workspace"
+  }
+}
 ```
+
+`environmentInfo` contains the same executor metadata returned by
+`environment/info`, so clients can use it without a second request.
+
+Rust clients cache this metadata for the client's lifetime, including session
+resumption. If initialization omits it, the first metadata request fetches and
+caches `environment/info`.
 
 ### `initialized`
 
@@ -85,7 +187,7 @@ Request params:
 {
   "processId": "proc-1",
   "argv": ["bash", "-lc", "printf 'hello\\n'"],
-  "cwd": "/absolute/working/directory",
+  "cwd": "file:///absolute/working/directory",
   "env": {
     "PATH": "/usr/bin:/bin"
   },
@@ -99,7 +201,7 @@ Field definitions:
 
 - `processId`: caller-chosen stable id for this process within the connection.
 - `argv`: command vector. It must be non-empty.
-- `cwd`: absolute working directory used for the child process.
+- `cwd`: `file:` URI for the child process working directory.
 - `env`: environment variables passed to the child process.
 - `tty`: when `true`, spawn a PTY-backed interactive process.
 - `pipeStdin`: when `true`, keep non-PTY stdin writable via `process/write`.
@@ -247,9 +349,14 @@ Params:
 {
   "processId": "proc-1",
   "seq": 2,
-  "exitCode": 0
+  "exitCode": 0,
+  "sandboxDenied": false
 }
 ```
+
+`sandboxDenied` lets streaming clients preserve executor-side sandbox denial
+detection without issuing a final `process/read` request. Clients recover it
+with `process/read` when an older server omits the field.
 
 ### `process/closed`
 
@@ -260,19 +367,24 @@ Params:
 
 ```json
 {
-  "processId": "proc-1"
+  "processId": "proc-1",
+  "seq": 3
 }
 ```
 
 ## Filesystem RPCs
 
-Filesystem methods use absolute paths and return JSON-RPC errors for invalid
-or unavailable paths:
+Filesystem methods require valid `file:` URI strings and return JSON-RPC errors
+for invalid or unavailable paths. Native absolute path strings are rejected;
+callers must convert them to `file:` URIs before sending requests:
 
 - `fs/readFile`
+- `fs/open`, `fs/readBlock`, and `fs/close` (internal transport for
+  `ExecutorFileSystem::read_file_stream`)
 - `fs/writeFile`
 - `fs/createDirectory`
 - `fs/getMetadata`
+- `fs/canonicalize`
 - `fs/readDirectory`
 - `fs/remove`
 - `fs/copy`
@@ -313,12 +425,16 @@ The crate exports:
 - `DEFAULT_LISTEN_URL` and `ExecServerListenUrlParseError`
 - `ExecServerRuntimePaths`
 - `run_main()` for embedding the websocket server
-- `RemoteExecutorConfig` and `run_remote_executor()` for embedding remote
+- `RemoteEnvironmentConfig` and `run_remote_environment()` for embedding remote
   registration mode
 
-Callers must pass `ExecServerRuntimePaths` to `run_main()`. The top-level
-`codex exec-server` command builds these paths from the `codex` arg0 dispatch
-state.
+Callers must pass `ExecServerRuntimePaths` and an explicitly configured
+`HttpClientFactory` to `run_main()`. The top-level `codex exec-server` command
+builds these paths from the `codex` arg0 dispatch state and resolves its HTTP
+client factory from the effective Codex configuration.
+`RemoteEnvironmentConfig::new(...)` also takes the auth provider and HTTP client
+factory that remote registration mode should use; the CLI builds the auth
+provider from Codex auth state before starting remote mode.
 
 ## Example session
 
@@ -326,14 +442,14 @@ Initialize:
 
 ```json
 {"id":1,"method":"initialize","params":{"clientName":"example-client"}}
-{"id":1,"result":{}}
+{"id":1,"result":{"sessionId":"00000000-0000-4000-8000-000000000001","environmentInfo":{"shell":{"name":"bash","path":"/bin/bash"},"cwd":"file:///tmp"}}}
 {"method":"initialized","params":{}}
 ```
 
 Start a process:
 
 ```json
-{"id":2,"method":"process/start","params":{"processId":"proc-1","argv":["bash","-lc","printf 'ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done"],"cwd":"/tmp","env":{"PATH":"/usr/bin:/bin"},"tty":true,"pipeStdin":false,"arg0":null}}
+{"id":2,"method":"process/start","params":{"processId":"proc-1","argv":["bash","-lc","printf 'ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done"],"cwd":"file:///tmp","env":{"PATH":"/usr/bin:/bin"},"tty":true,"pipeStdin":false,"arg0":null}}
 {"id":2,"result":{"processId":"proc-1"}}
 {"method":"process/output","params":{"processId":"proc-1","seq":1,"stream":"stdout","chunk":"cmVhZHkK"}}
 ```
@@ -351,6 +467,6 @@ Terminate it:
 ```json
 {"id":4,"method":"process/terminate","params":{"processId":"proc-1"}}
 {"id":4,"result":{"running":true}}
-{"method":"process/exited","params":{"processId":"proc-1","seq":3,"exitCode":0}}
-{"method":"process/closed","params":{"processId":"proc-1"}}
+{"method":"process/exited","params":{"processId":"proc-1","seq":3,"exitCode":0,"sandboxDenied":false}}
+{"method":"process/closed","params":{"processId":"proc-1","seq":4}}
 ```

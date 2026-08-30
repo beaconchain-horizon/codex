@@ -102,18 +102,18 @@ impl ChatComposer {
     /// from replacing an empty composer with the latest prompt before the user has searched for
     /// anything.
     pub(super) fn begin_history_search(&mut self) -> (InputResult, bool) {
-        if let Some(pasted) = self.paste_burst.flush_before_modified_input() {
+        if let Some(pasted) = self.draft.paste_burst.flush_before_modified_input() {
             self.handle_paste(pasted);
         }
-        self.paste_burst.clear_window_after_non_char();
+        self.draft.paste_burst.clear_window_after_non_char();
 
-        if self.current_file_query.is_some() {
+        if self.popups.current_file_query.is_some() {
             self.app_event_tx
                 .send(AppEvent::StartFileSearch(String::new()));
-            self.current_file_query = None;
+            self.popups.current_file_query = None;
         }
-        self.active_popup = ActivePopup::None;
-        self.selected_remote_image_index = None;
+        self.popups.active = ActivePopup::None;
+        self.attachments.clear_remote_image_selection();
         self.history_search = Some(HistorySearchSession {
             original_draft: self.snapshot_draft(),
             query: String::new(),
@@ -185,7 +185,7 @@ impl ChatComposer {
                 {
                     self.history_search = None;
                     self.history.reset_search();
-                    self.footer_mode = reset_mode_after_activity(self.footer_mode);
+                    self.footer.mode = reset_mode_after_activity(self.footer.mode);
                     self.move_cursor_to_end();
                 }
                 (InputResult::None, true)
@@ -296,7 +296,7 @@ impl ChatComposer {
             return false;
         };
         self.history.reset_navigation();
-        self.footer_mode = reset_mode_after_activity(self.footer_mode);
+        self.footer.mode = reset_mode_after_activity(self.footer.mode);
         self.restore_draft(search.original_draft);
         true
     }
@@ -305,9 +305,10 @@ impl ChatComposer {
     ///
     /// `Found` previews the matching entry, `Pending` keeps the footer in a waiting state while an
     /// async persistent entry lookup is outstanding, `AtBoundary` preserves the current match, and
-    /// `NotFound` restores the original draft while keeping the query available for further edits.
-    /// Treating `AtBoundary` like `NotFound` would produce the visible "no match" flicker at the
-    /// end of a one-result search and desynchronize Up/Down counts.
+    /// `NotFound` restores the original draft while keeping the query available for further edits,
+    /// and `Unavailable` does the same without claiming there was no match. Treating `AtBoundary`
+    /// like `NotFound` would produce the visible "no match" flicker at the end of a one-result
+    /// search and desynchronize Up/Down counts.
     pub(super) fn apply_history_search_result(&mut self, result: HistorySearchResult) {
         match result {
             HistorySearchResult::Found(entry) => {
@@ -326,13 +327,17 @@ impl ChatComposer {
                     search.status = HistorySearchStatus::Match;
                 }
             }
-            HistorySearchResult::NotFound => {
+            result @ (HistorySearchResult::NotFound | HistorySearchResult::Unavailable) => {
                 let original_draft = self
                     .history_search
                     .as_ref()
                     .map(|search| search.original_draft.clone());
                 if let Some(search) = self.history_search.as_mut() {
-                    search.status = HistorySearchStatus::NoMatch;
+                    search.status = if matches!(result, HistorySearchResult::NotFound) {
+                        HistorySearchStatus::NoMatch
+                    } else {
+                        HistorySearchStatus::Idle
+                    };
                 }
                 if let Some(original_draft) = original_draft {
                     self.restore_draft(original_draft);
@@ -385,7 +390,7 @@ impl ChatComposer {
         if !matches!(search.status, HistorySearchStatus::Match) || search.query.is_empty() {
             return Vec::new();
         }
-        Self::case_insensitive_match_ranges(self.textarea.text(), &search.query)
+        Self::case_insensitive_match_ranges(self.draft.textarea.text(), &search.query)
     }
 
     fn case_insensitive_match_ranges(text: &str, query: &str) -> Vec<Range<usize>> {
@@ -414,24 +419,21 @@ impl ChatComposer {
 
         let mut ranges = Vec::new();
         let mut search_from = 0;
+        // Use two-pointer method to find matches in linear time.
+        let mut start_span = 0;
+        let mut end_span = 0;
         while search_from <= folded.len()
             && let Some(relative_start) = folded[search_from..].find(&query_lower)
         {
             let folded_start = search_from + relative_start;
             let folded_end = folded_start + query_lower.len();
-            if let Some((_, first_original)) = folded_spans.iter().find(|(folded_range, _)| {
-                folded_range.end > folded_start && folded_range.start < folded_end
-            }) {
-                let original_end = folded_spans
-                    .iter()
-                    .rev()
-                    .find(|(folded_range, _)| {
-                        folded_range.end > folded_start && folded_range.start < folded_end
-                    })
-                    .map(|(_, original_range)| original_range.end)
-                    .unwrap_or(first_original.end);
-                ranges.push(first_original.start..original_end);
+            while folded_spans[start_span].0.end <= folded_start {
+                start_span += 1;
             }
+            while folded_spans[end_span].0.end < folded_end {
+                end_span += 1;
+            }
+            ranges.push(folded_spans[start_span].1.start..folded_spans[end_span].1.end);
             search_from = folded_end;
         }
         ranges
@@ -494,12 +496,157 @@ mod tests {
     use tokio::sync::mpsc::unbounded_channel;
 
     use super::super::super::chat_composer_history::HistoryEntry;
+    use super::super::super::chat_composer_history::HistorySearchResult;
     use super::super::super::footer::FooterMode;
     use super::super::ChatComposer;
+    use super::super::InputResult;
+    use super::super::tests::type_chars_humanlike;
     use super::HistorySearchStatus;
     use crate::app_event::AppEvent;
     use crate::app_event_sender::AppEventSender;
     use crate::render::renderable::Renderable;
+
+    #[test]
+    fn vim_normal_j_k_navigate_history_at_history_boundaries() {
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            /*has_input_focus*/ true,
+            sender,
+            /*enhanced_keys_supported*/ false,
+            "Ask Codex to do anything".to_string(),
+            /*disable_paste_burst*/ false,
+        );
+
+        type_chars_humanlike(&mut composer, &['f', 'i', 'r', 's', 't']);
+        let (result, _needs_redraw) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(result, InputResult::Submitted { .. }));
+
+        type_chars_humanlike(&mut composer, &['s', 'e', 'c', 'o', 'n', 'd']);
+        let (result, _needs_redraw) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(result, InputResult::Submitted { .. }));
+
+        composer.set_vim_enabled(/*enabled*/ true);
+
+        let (_result, _needs_redraw) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(composer.draft.textarea.text(), "second");
+        assert_eq!(composer.draft.textarea.cursor(), "second".len() - 1);
+
+        let (_result, _needs_redraw) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(composer.draft.textarea.text(), "first");
+        assert_eq!(composer.draft.textarea.cursor(), "first".len() - 1);
+
+        let (_result, _needs_redraw) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(composer.draft.textarea.text(), "second");
+        assert_eq!(composer.draft.textarea.cursor(), "second".len() - 1);
+
+        let (_result, _needs_redraw) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert!(composer.draft.textarea.is_empty());
+        assert_eq!(
+            composer.draft.textarea.cursor(),
+            composer.draft.textarea.text().len()
+        );
+    }
+
+    #[test]
+    fn remapped_vim_normal_history_navigation_does_not_fall_back_to_j_k() {
+        use crate::key_hint;
+        use crate::keymap::RuntimeKeymap;
+
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            /*has_input_focus*/ true,
+            sender,
+            /*enhanced_keys_supported*/ false,
+            "Ask Codex to do anything".to_string(),
+            /*disable_paste_burst*/ false,
+        );
+
+        type_chars_humanlike(&mut composer, &['f', 'i', 'r', 's', 't']);
+        let (result, _needs_redraw) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(result, InputResult::Submitted { .. }));
+
+        let mut keymap = RuntimeKeymap::defaults();
+        keymap.vim_normal.move_up = vec![key_hint::plain(KeyCode::F(2))];
+        keymap.vim_normal.move_down = vec![key_hint::plain(KeyCode::F(3))];
+        composer.set_keymap_bindings(&keymap);
+        composer.set_vim_enabled(/*enabled*/ true);
+
+        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert!(composer.draft.textarea.is_empty());
+
+        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+        assert_eq!(composer.draft.textarea.text(), "first");
+
+        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE));
+        assert!(composer.draft.textarea.is_empty());
+    }
+
+    #[test]
+    fn vim_normal_j_k_fall_back_to_multiline_cursor_movement() {
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            /*has_input_focus*/ true,
+            sender,
+            /*enhanced_keys_supported*/ false,
+            "Ask Codex to do anything".to_string(),
+            /*disable_paste_burst*/ false,
+        );
+        composer
+            .draft
+            .textarea
+            .set_text_clearing_elements("one\ntwo");
+        composer.draft.textarea.set_cursor(/*pos*/ 0);
+        composer.set_vim_enabled(/*enabled*/ true);
+
+        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(composer.draft.textarea.cursor(), "one\n".len());
+
+        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(composer.draft.textarea.cursor(), 0);
+    }
+
+    #[test]
+    fn vim_normal_operator_motion_does_not_navigate_history() {
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            /*has_input_focus*/ true,
+            sender,
+            /*enhanced_keys_supported*/ false,
+            "Ask Codex to do anything".to_string(),
+            /*disable_paste_burst*/ false,
+        );
+
+        type_chars_humanlike(&mut composer, &['f', 'i', 'r', 's', 't']);
+        let (result, _needs_redraw) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(result, InputResult::Submitted { .. }));
+
+        type_chars_humanlike(&mut composer, &['s', 'e', 'c', 'o', 'n', 'd']);
+        let (result, _needs_redraw) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(result, InputResult::Submitted { .. }));
+
+        composer.set_vim_enabled(/*enabled*/ true);
+
+        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(composer.draft.textarea.text(), "second");
+
+        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert!(composer.draft.textarea.is_empty());
+        assert_eq!(composer.current_text(), "");
+    }
 
     #[test]
     fn history_search_opens_without_previewing_latest_entry() {
@@ -520,8 +667,34 @@ mod tests {
         let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
 
         assert!(composer.history_search_active());
-        assert!(composer.textarea.is_empty());
+        assert!(composer.draft.textarea.is_empty());
         assert_eq!(composer.footer_mode(), FooterMode::HistorySearch);
+    }
+
+    #[test]
+    fn unavailable_history_search_restores_idle_draft() {
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            /*has_input_focus*/ true,
+            sender,
+            /*enhanced_keys_supported*/ false,
+            "Ask Codex to do anything".to_string(),
+            /*disable_paste_burst*/ false,
+        );
+        composer.set_text_content("draft".to_string(), Vec::new(), Vec::new());
+        composer.begin_history_search();
+        composer.apply_history_search_result(HistorySearchResult::Pending);
+
+        composer.apply_history_search_result(HistorySearchResult::Unavailable);
+
+        assert_eq!(composer.draft.textarea.text(), "draft");
+        assert!(
+            composer
+                .history_search
+                .as_ref()
+                .is_some_and(|search| matches!(search.status, HistorySearchStatus::Idle))
+        );
     }
 
     #[test]
@@ -535,6 +708,25 @@ mod tests {
             vec![1..3, 4..5]
         );
         assert!(ChatComposer::case_insensitive_match_ranges("git", "").is_empty());
+    }
+
+    #[test]
+    fn history_search_match_ranges_preserve_unicode_boundaries() {
+        for (text, query, expected) in [
+            ("İİ", "i", vec![0..2, 2..4]),
+            ("İİ", "\u{307}", vec![0..2, 2..4]),
+            ("İİİ", "\u{307}i", vec![0..4, 2..6]),
+            ("éÉ é", "É", vec![0..2, 2..4, 5..7]),
+            ("aaaaa", "aa", vec![0..2, 2..4]),
+            ("", "x", vec![]),
+            ("abc", "z", vec![]),
+        ] {
+            assert_eq!(
+                ChatComposer::case_insensitive_match_ranges(text, query),
+                expected,
+                "text: {text:?}, query: {query:?}"
+            );
+        }
     }
 
     #[test]
@@ -558,18 +750,21 @@ mod tests {
 
         let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
         assert!(composer.history_search_active());
-        assert_eq!(composer.textarea.text(), "draft");
+        assert_eq!(composer.draft.textarea.text(), "draft");
 
         for ch in ['g', 'i', 't'] {
             let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
         }
-        assert_eq!(composer.textarea.text(), "git status");
+        assert_eq!(composer.draft.textarea.text(), "git status");
         assert_eq!(composer.footer_mode(), FooterMode::HistorySearch);
 
         let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(!composer.history_search_active());
-        assert_eq!(composer.textarea.text(), "git status");
-        assert_eq!(composer.textarea.cursor(), composer.textarea.text().len());
+        assert_eq!(composer.draft.textarea.text(), "git status");
+        assert_eq!(
+            composer.draft.textarea.cursor(),
+            composer.draft.textarea.text().len()
+        );
     }
 
     #[test]
@@ -593,8 +788,8 @@ mod tests {
             let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
         }
 
-        assert_eq!(composer.textarea.text(), "git status");
-        assert_eq!(composer.textarea.cursor(), "git status".len() - 1);
+        assert_eq!(composer.draft.textarea.text(), "git status");
+        assert_eq!(composer.draft.textarea.cursor(), "git status".len() - 1);
         assert_eq!(composer.footer_mode(), FooterMode::HistorySearch);
     }
 
@@ -618,13 +813,19 @@ mod tests {
         for ch in ['b', 'u', 'g'] {
             let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
         }
-        assert_eq!(composer.textarea.text(), "Find and fix a bug in @filename");
+        assert_eq!(
+            composer.draft.textarea.text(),
+            "Find and fix a bug in @filename"
+        );
 
         for _ in 0..3 {
             let _ =
                 composer.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
         }
-        assert_eq!(composer.textarea.text(), "Find and fix a bug in @filename");
+        assert_eq!(
+            composer.draft.textarea.text(),
+            "Find and fix a bug in @filename"
+        );
         assert!(
             composer
                 .history_search
@@ -635,7 +836,10 @@ mod tests {
         for _ in 0..3 {
             let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         }
-        assert_eq!(composer.textarea.text(), "Find and fix a bug in @filename");
+        assert_eq!(
+            composer.draft.textarea.text(),
+            "Find and fix a bug in @filename"
+        );
         assert!(
             composer
                 .history_search
@@ -776,17 +980,17 @@ mod tests {
             .history
             .record_local_submission(HistoryEntry::new("remembered command".to_string()));
         composer.set_text_content("draft".to_string(), Vec::new(), Vec::new());
-        composer.textarea.set_cursor(/*pos*/ 2);
+        composer.draft.textarea.set_cursor(/*pos*/ 2);
 
         let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
-        assert_eq!(composer.textarea.text(), "draft");
+        assert_eq!(composer.draft.textarea.text(), "draft");
         let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
-        assert_eq!(composer.textarea.text(), "remembered command");
+        assert_eq!(composer.draft.textarea.text(), "remembered command");
 
         let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(!composer.history_search_active());
-        assert_eq!(composer.textarea.text(), "draft");
-        assert_eq!(composer.textarea.cursor(), 2);
+        assert_eq!(composer.draft.textarea.text(), "draft");
+        assert_eq!(composer.draft.textarea.cursor(), 2);
     }
 
     #[test]
@@ -805,13 +1009,13 @@ mod tests {
                 .history
                 .record_local_submission(HistoryEntry::new("remembered command".to_string()));
             composer.set_text_content("draft".to_string(), Vec::new(), Vec::new());
-            composer.textarea.set_cursor(/*pos*/ 2);
+            composer.draft.textarea.set_cursor(/*pos*/ 2);
 
             let _ =
                 composer.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
             let _ =
                 composer.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
-            assert_eq!(composer.textarea.text(), "remembered command");
+            assert_eq!(composer.draft.textarea.text(), "remembered command");
             composer
         }
 
@@ -824,8 +1028,8 @@ mod tests {
             let _ = composer.handle_key_event(cancel_key);
 
             assert!(!composer.history_search_active());
-            assert_eq!(composer.textarea.text(), "draft");
-            assert_eq!(composer.textarea.cursor(), 2);
+            assert_eq!(composer.draft.textarea.text(), "draft");
+            assert_eq!(composer.draft.textarea.cursor(), 2);
         }
     }
 
@@ -843,18 +1047,18 @@ mod tests {
 
         let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
         assert!(composer.is_in_paste_burst());
-        assert_eq!(composer.textarea.text(), "");
+        assert_eq!(composer.draft.textarea.text(), "");
 
         let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
 
         assert!(composer.history_search_active());
         assert!(!composer.is_in_paste_burst());
-        assert_eq!(composer.textarea.text(), "h");
+        assert_eq!(composer.draft.textarea.text(), "h");
 
         let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
         assert!(!composer.history_search_active());
-        assert_eq!(composer.textarea.text(), "h");
+        assert_eq!(composer.draft.textarea.text(), "h");
     }
 
     #[test]
@@ -881,18 +1085,18 @@ mod tests {
             now += Duration::from_millis(1);
         }
         assert!(composer.is_in_paste_burst());
-        assert_eq!(composer.textarea.text(), "");
+        assert_eq!(composer.draft.textarea.text(), "");
 
         let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
 
         assert!(composer.history_search_active());
         assert!(!composer.is_in_paste_burst());
-        assert_eq!(composer.textarea.text(), "paste");
+        assert_eq!(composer.draft.textarea.text(), "paste");
 
         let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
         assert!(!composer.history_search_active());
-        assert_eq!(composer.textarea.text(), "paste");
+        assert_eq!(composer.draft.textarea.text(), "paste");
     }
 
     #[test]
@@ -918,14 +1122,14 @@ mod tests {
         for ch in ['m', 'a', 't', 'c', 'h'] {
             let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
         }
-        assert_eq!(composer.textarea.text(), "oldest matching entry");
+        assert_eq!(composer.draft.textarea.text(), "oldest matching entry");
 
         let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(!composer.history_search_active());
-        assert!(composer.textarea.is_empty());
+        assert!(composer.draft.textarea.is_empty());
 
         let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        assert_eq!(composer.textarea.text(), "newest entry");
+        assert_eq!(composer.draft.textarea.text(), "newest entry");
     }
 
     #[test]
@@ -950,7 +1154,7 @@ mod tests {
         }
 
         assert!(composer.history_search_active());
-        assert_eq!(composer.textarea.text(), "draft");
+        assert_eq!(composer.draft.textarea.text(), "draft");
         assert_eq!(composer.footer_mode(), FooterMode::HistorySearch);
     }
 }

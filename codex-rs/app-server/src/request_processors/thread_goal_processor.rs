@@ -1,5 +1,22 @@
+use super::thread_input::DIRECT_INPUT_TO_MULTI_AGENT_V2_SUBAGENT_ERROR;
+use super::thread_input::can_accept_direct_input;
+use super::thread_input::ensure_direct_input_allowed;
 use super::*;
-use codex_protocol::protocol::validate_thread_goal_objective;
+use codex_goal_extension::GoalObjectiveUpdate;
+use codex_goal_extension::GoalService;
+use codex_goal_extension::GoalServiceError;
+use codex_goal_extension::GoalSetRequest;
+use codex_goal_extension::GoalTokenBudgetUpdate;
+use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::SubAgentSource;
+use codex_protocol::protocol::ThreadSettingsAppliedEvent;
+use codex_protocol::protocol::ThreadSettingsSnapshot;
+use codex_rollout::RolloutRecorder;
+
+enum GoalAccess {
+    Read,
+    Mutate,
+}
 
 #[derive(Clone)]
 pub(crate) struct ThreadGoalRequestProcessor {
@@ -8,6 +25,7 @@ pub(crate) struct ThreadGoalRequestProcessor {
     config: Arc<Config>,
     thread_state_manager: ThreadStateManager,
     state_db: Option<StateDbHandle>,
+    goal_service: Arc<GoalService>,
 }
 
 impl ThreadGoalRequestProcessor {
@@ -17,6 +35,7 @@ impl ThreadGoalRequestProcessor {
         config: Arc<Config>,
         thread_state_manager: ThreadStateManager,
         state_db: Option<StateDbHandle>,
+        goal_service: Arc<GoalService>,
     ) -> Self {
         Self {
             thread_manager,
@@ -24,6 +43,7 @@ impl ThreadGoalRequestProcessor {
             config,
             thread_state_manager,
             state_db,
+            goal_service,
         }
     }
 
@@ -56,20 +76,11 @@ impl ThreadGoalRequestProcessor {
             .map(|()| None)
     }
 
-    pub(crate) async fn emit_resume_goal_snapshot_and_continue(
-        &self,
-        thread_id: ThreadId,
-        thread: &CodexThread,
-    ) {
+    pub(crate) async fn emit_resume_goal_snapshot(&self, thread_id: ThreadId) {
         if !self.config.features.enabled(Feature::Goals) {
             return;
         }
         self.emit_thread_goal_snapshot(thread_id).await;
-        // App-server owns resume response and snapshot ordering, so wait until
-        // those are sent before letting core start goal continuation.
-        if let Err(err) = thread.continue_active_goal_if_idle().await {
-            tracing::warn!("failed to continue active goal after resume: {err}");
-        }
     }
 
     pub(crate) async fn pending_resume_goal_state(
@@ -89,6 +100,26 @@ impl ThreadGoalRequestProcessor {
         (emit_thread_goal_update, thread_goal_state_db)
     }
 
+    pub(crate) async fn restore_inherited_goal_runtime(&self, thread_id: ThreadId) {
+        if let Err(err) = self
+            .goal_service
+            .restore_thread_runtime_after_resume(thread_id)
+            .await
+        {
+            warn!("failed to restore inherited goal runtime for {thread_id}: {err}");
+        }
+    }
+
+    pub(crate) async fn flush_goal_progress_for_fork(
+        &self,
+        thread_id: ThreadId,
+    ) -> Result<(), String> {
+        self.goal_service
+            .flush_thread_goal_progress_for_fork(thread_id)
+            .await
+            .map_err(|err| err.to_string())
+    }
+
     async fn thread_goal_set_inner(
         &self,
         request_id: ConnectionRequestId,
@@ -99,129 +130,85 @@ impl ThreadGoalRequestProcessor {
         }
 
         let thread_id = parse_thread_id_for_request(params.thread_id.as_str())?;
-        let state_db = self.state_db_for_materialized_thread(thread_id).await?;
-        let running_thread = self.thread_manager.get_thread(thread_id).await.ok();
-        let rollout_path = match running_thread.as_ref() {
-            Some(thread) => thread.rollout_path().ok_or_else(|| {
-                invalid_request(format!(
-                    "ephemeral thread does not support goals: {thread_id}"
-                ))
-            })?,
-            None => find_thread_path_by_id_str(
-                &self.config.codex_home,
-                &thread_id.to_string(),
-                self.state_db.as_deref(),
-            )
-            .await
-            .map_err(|err| {
-                internal_error(format!("failed to locate thread id {thread_id}: {err}"))
-            })?
-            .ok_or_else(|| invalid_request(format!("thread not found: {thread_id}")))?,
+        let state_db = self
+            .state_db_for_materialized_thread(thread_id, GoalAccess::Mutate)
+            .await?;
+        self.reconcile_thread_goal_rollout(thread_id, &state_db)
+            .await?;
+        let max_goal_token_budget = match self.thread_manager.get_thread(thread_id).await {
+            Ok(thread) => thread.config().await.max_goal_token_budget,
+            Err(_) => self.config.max_goal_token_budget,
         };
-        reconcile_rollout(
-            Some(&state_db),
-            rollout_path.as_path(),
-            self.config.model_provider_id.as_str(),
-            /*builder*/ None,
-            &[],
-            /*archived_only*/ None,
-            /*new_thread_memory_mode*/ None,
-        )
-        .await;
 
         let listener_command_tx = {
             let thread_state = self.thread_state_manager.thread_state(thread_id).await;
             let thread_state = thread_state.lock().await;
             thread_state.listener_command_tx()
         };
-        let status = params.status.map(thread_goal_status_to_state);
-        let objective = params.objective.as_deref().map(str::trim);
+        let status = params.status.map(ThreadGoalStatus::to_core);
+        let objective = params.objective.as_deref();
 
-        if let Some(objective) = objective {
-            validate_thread_goal_objective(objective).map_err(invalid_request)?;
-        }
-        if objective.is_some() || params.token_budget.is_some() {
-            validate_goal_budget(params.token_budget.flatten()).map_err(invalid_request)?;
-        }
-
-        if let Some(thread) = running_thread.as_ref() {
-            thread.prepare_external_goal_mutation().await;
-        }
-
-        let (goal, previous_status) = (if let Some(objective) = objective {
-            let existing_goal = state_db
-                .get_thread_goal(thread_id)
-                .await
-                .map_err(|err| invalid_request(err.to_string()))?;
-            if let Some(goal) = existing_goal.as_ref().filter(|goal| {
-                goal.objective == objective
-                    && goal.status != codex_state::ThreadGoalStatus::Complete
-            }) {
-                let previous_status = ExternalGoalPreviousStatus::Existing(goal.status);
-                state_db
-                    .update_thread_goal(
-                        thread_id,
-                        codex_state::ThreadGoalUpdate {
-                            status,
-                            token_budget: params.token_budget,
-                            expected_goal_id: Some(goal.goal_id.clone()),
-                        },
-                    )
-                    .await
-                    .and_then(|goal| {
-                        goal.ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "cannot update goal for thread {thread_id}: no goal exists"
-                            )
-                        })
-                    })
-                    .map(|goal| (goal, previous_status))
-            } else {
-                let previous_status = ExternalGoalPreviousStatus::NewGoal;
-                state_db
-                    .replace_thread_goal(
-                        thread_id,
-                        objective,
-                        status.unwrap_or(codex_state::ThreadGoalStatus::Active),
-                        params.token_budget.flatten(),
-                    )
-                    .await
-                    .map(|goal| (goal, previous_status))
-            }
-        } else {
-            let existing_goal = state_db
-                .get_thread_goal(thread_id)
-                .await
-                .map_err(|err| invalid_request(err.to_string()))?;
-            let Some(existing_goal) = existing_goal else {
-                return Err(invalid_request(format!(
-                    "cannot update goal for thread {thread_id}: no goal exists"
-                )));
-            };
-            let previous_status = ExternalGoalPreviousStatus::Existing(existing_goal.status);
-            state_db
-                .update_thread_goal(
+        let outcome = self
+            .goal_service
+            .set_thread_goal(
+                &state_db,
+                GoalSetRequest {
                     thread_id,
-                    codex_state::ThreadGoalUpdate {
-                        status,
-                        token_budget: params.token_budget,
-                        expected_goal_id: None,
+                    objective: objective
+                        .map(GoalObjectiveUpdate::Set)
+                        .unwrap_or(GoalObjectiveUpdate::Keep),
+                    status,
+                    token_budget: match params.token_budget {
+                        Some(token_budget) => GoalTokenBudgetUpdate::Set(token_budget),
+                        None => GoalTokenBudgetUpdate::Keep,
                     },
-                )
-                .await
-                .and_then(|goal| {
-                    goal.ok_or_else(|| {
-                        anyhow::anyhow!("cannot update goal for thread {thread_id}: no goal exists")
-                    })
-                })
-                .map(|goal| (goal, previous_status))
-        })
-        .map_err(|err| invalid_request(err.to_string()))?;
-        let external_goal_set = ExternalGoalSet {
-            goal: goal.clone(),
-            previous_status,
+                    max_goal_token_budget,
+                },
+            )
+            .await
+            .map_err(goal_service_error)?;
+        let goal = ThreadGoal::from(outcome.goal.clone());
+
+        let persist_result = match self.thread_manager.get_thread(thread_id).await {
+            Ok(thread) => match thread.rollout_path() {
+                Some(path) if codex_rollout::existing_rollout_path(&path).await.is_none() => {
+                    // Goal-first threads need their settings captured when the goal creates the
+                    // rollout. Once materialized, normal settings updates own this event.
+                    let persisted_settings = thread.thread_settings_snapshot().await;
+                    let items = [
+                        thread_settings_applied_item(thread_id, persisted_settings.clone()),
+                        outcome.thread_goal_updated_item(),
+                    ];
+                    match thread.append_rollout_items(&items).await {
+                        Err(err) => Err(err),
+                        Ok(()) => {
+                            // Catch up a settings update queued while the rollout materialized.
+                            let current_settings = thread.thread_settings_snapshot().await;
+                            if current_settings == persisted_settings {
+                                Ok(())
+                            } else {
+                                thread
+                                    .append_rollout_items(&[thread_settings_applied_item(
+                                        thread_id,
+                                        current_settings,
+                                    )])
+                                    .await
+                            }
+                        }
+                    }
+                }
+                Some(_) | None => {
+                    thread
+                        .append_rollout_items(&[outcome.thread_goal_updated_item()])
+                        .await
+                }
+            },
+            Err(_) => Ok(()),
         };
-        let goal = api_thread_goal_from_state(goal);
+        if let Err(err) = persist_result {
+            warn!("failed to persist goal update for live thread {thread_id}: {err}");
+        }
+
         self.outgoing
             .send_response(
                 request_id.clone(),
@@ -230,9 +217,7 @@ impl ThreadGoalRequestProcessor {
             .await;
         self.emit_thread_goal_updated_ordered(thread_id, goal, listener_command_tx)
             .await;
-        if let Some(thread) = running_thread.as_ref() {
-            thread.apply_external_goal_set(external_goal_set).await;
-        }
+        outcome.apply_runtime_effects(&self.goal_service).await;
         Ok(())
     }
 
@@ -245,12 +230,15 @@ impl ThreadGoalRequestProcessor {
         }
 
         let thread_id = parse_thread_id_for_request(params.thread_id.as_str())?;
-        let state_db = self.state_db_for_materialized_thread(thread_id).await?;
-        let goal = state_db
-            .get_thread_goal(thread_id)
+        let state_db = self
+            .state_db_for_materialized_thread(thread_id, GoalAccess::Read)
+            .await?;
+        let goal = self
+            .goal_service
+            .get_thread_goal(&state_db, thread_id)
             .await
-            .map_err(|err| internal_error(format!("failed to read thread goal: {err}")))?
-            .map(api_thread_goal_from_state);
+            .map_err(goal_service_error)?
+            .map(ThreadGoal::from);
         Ok(ThreadGoalGetResponse { goal })
     }
 
@@ -264,53 +252,22 @@ impl ThreadGoalRequestProcessor {
         }
 
         let thread_id = parse_thread_id_for_request(params.thread_id.as_str())?;
-        let state_db = self.state_db_for_materialized_thread(thread_id).await?;
-        let running_thread = self.thread_manager.get_thread(thread_id).await.ok();
-        let rollout_path = match running_thread.as_ref() {
-            Some(thread) => thread.rollout_path().ok_or_else(|| {
-                invalid_request(format!(
-                    "ephemeral thread does not support goals: {thread_id}"
-                ))
-            })?,
-            None => find_thread_path_by_id_str(
-                &self.config.codex_home,
-                &thread_id.to_string(),
-                self.state_db.as_deref(),
-            )
-            .await
-            .map_err(|err| {
-                internal_error(format!("failed to locate thread id {thread_id}: {err}"))
-            })?
-            .ok_or_else(|| invalid_request(format!("thread not found: {thread_id}")))?,
-        };
-        reconcile_rollout(
-            Some(&state_db),
-            rollout_path.as_path(),
-            self.config.model_provider_id.as_str(),
-            /*builder*/ None,
-            &[],
-            /*archived_only*/ None,
-            /*new_thread_memory_mode*/ None,
-        )
-        .await;
-
-        if let Some(thread) = running_thread.as_ref() {
-            thread.prepare_external_goal_mutation().await;
-        }
+        let state_db = self
+            .state_db_for_materialized_thread(thread_id, GoalAccess::Mutate)
+            .await?;
+        self.reconcile_thread_goal_rollout(thread_id, &state_db)
+            .await?;
 
         let listener_command_tx = {
             let thread_state = self.thread_state_manager.thread_state(thread_id).await;
             let thread_state = thread_state.lock().await;
             thread_state.listener_command_tx()
         };
-        let cleared = state_db
-            .delete_thread_goal(thread_id)
+        let cleared = self
+            .goal_service
+            .clear_thread_goal(&state_db, thread_id)
             .await
-            .map_err(|err| internal_error(format!("failed to clear thread goal: {err}")))?;
-
-        if cleared && let Some(thread) = running_thread.as_ref() {
-            thread.apply_external_goal_clear().await;
-        }
+            .map_err(goal_service_error)?;
 
         self.outgoing
             .send_response(request_id, ThreadGoalClearResponse { cleared })
@@ -325,8 +282,12 @@ impl ThreadGoalRequestProcessor {
     async fn state_db_for_materialized_thread(
         &self,
         thread_id: ThreadId,
+        access: GoalAccess,
     ) -> Result<StateDbHandle, JSONRPCErrorError> {
         if let Ok(thread) = self.thread_manager.get_thread(thread_id).await {
+            if matches!(access, GoalAccess::Mutate) {
+                ensure_direct_input_allowed(thread.as_ref()).await?;
+            }
             if thread.rollout_path().is_none() {
                 return Err(invalid_request(format!(
                     "ephemeral thread does not support goals: {thread_id}"
@@ -336,7 +297,7 @@ impl ThreadGoalRequestProcessor {
                 return Ok(state_db);
             }
         } else {
-            find_thread_path_by_id_str(
+            let rollout_path = codex_rollout::find_thread_path_by_id_str(
                 &self.config.codex_home,
                 &thread_id.to_string(),
                 self.state_db.as_deref(),
@@ -346,6 +307,38 @@ impl ThreadGoalRequestProcessor {
                 internal_error(format!("failed to locate thread id {thread_id}: {err}"))
             })?
             .ok_or_else(|| invalid_request(format!("thread not found: {thread_id}")))?;
+            if matches!(access, GoalAccess::Mutate) {
+                let session_meta = codex_rollout::read_session_meta_line(&rollout_path)
+                    .await
+                    .map_err(|err| {
+                        internal_error(format!("failed to read thread ownership: {err}"))
+                    })?;
+                if session_meta.meta.id != thread_id {
+                    return Err(invalid_request(
+                        "thread metadata does not match requested id",
+                    ));
+                }
+                if matches!(
+                    session_meta.meta.source,
+                    SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
+                ) {
+                    // Match resume's latest version metadata, including legacy TurnContext
+                    // fallback, rather than trusting only the initial session header.
+                    let history = RolloutRecorder::get_rollout_history(&rollout_path)
+                        .await
+                        .map_err(|err| {
+                            internal_error(format!("failed to read thread ownership: {err}"))
+                        })?;
+                    if !can_accept_direct_input(
+                        history.get_multi_agent_version(),
+                        &session_meta.meta.source,
+                    ) {
+                        return Err(invalid_request(
+                            DIRECT_INPUT_TO_MULTI_AGENT_V2_SUBAGENT_ERROR,
+                        ));
+                    }
+                }
+            }
         }
 
         self.state_db
@@ -353,8 +346,60 @@ impl ThreadGoalRequestProcessor {
             .ok_or_else(|| internal_error("sqlite state db unavailable for thread goals"))
     }
 
-    async fn emit_thread_goal_snapshot(&self, thread_id: ThreadId) {
-        let state_db = match self.state_db_for_materialized_thread(thread_id).await {
+    async fn reconcile_thread_goal_rollout(
+        &self,
+        thread_id: ThreadId,
+        state_db: &StateDbHandle,
+    ) -> Result<(), JSONRPCErrorError> {
+        let running_thread = self.thread_manager.get_thread(thread_id).await.ok();
+        let rollout_path = match running_thread.as_ref() {
+            Some(thread) => thread.rollout_path().ok_or_else(|| {
+                invalid_request(format!(
+                    "ephemeral thread does not support goals: {thread_id}"
+                ))
+            })?,
+            None => codex_rollout::find_thread_path_by_id_str(
+                &self.config.codex_home,
+                &thread_id.to_string(),
+                self.state_db.as_deref(),
+            )
+            .await
+            .map_err(|err| {
+                internal_error(format!("failed to locate thread id {thread_id}: {err}"))
+            })?
+            .ok_or_else(|| invalid_request(format!("thread not found: {thread_id}")))?,
+        };
+
+        if let Ok(Some(metadata)) = state_db.get_thread(thread_id).await
+            && codex_rollout::plain_rollout_path(metadata.rollout_path.as_path())
+                == codex_rollout::plain_rollout_path(rollout_path.as_path())
+            && let Some(existing_path) =
+                codex_rollout::existing_rollout_path(metadata.rollout_path.as_path()).await
+            && codex_rollout::read_session_meta_line(existing_path.as_path())
+                .await
+                .is_ok_and(|session_meta| session_meta.meta.id == thread_id)
+        {
+            return Ok(());
+        }
+
+        reconcile_rollout(
+            Some(state_db),
+            rollout_path.as_path(),
+            self.config.model_provider_id.as_str(),
+            /*builder*/ None,
+            &[],
+            /*archived_only*/ None,
+            /*new_thread_memory_mode*/ None,
+        )
+        .await;
+        Ok(())
+    }
+
+    pub(crate) async fn emit_thread_goal_snapshot(&self, thread_id: ThreadId) {
+        let state_db = match self
+            .state_db_for_materialized_thread(thread_id, GoalAccess::Read)
+            .await
+        {
             Ok(state_db) => state_db,
             Err(err) => {
                 warn!(
@@ -391,6 +436,7 @@ impl ThreadGoalRequestProcessor {
     ) {
         if let Some(listener_command_tx) = listener_command_tx {
             let command = crate::thread_state::ThreadListenerCommand::EmitThreadGoalUpdated {
+                turn_id: None,
                 goal: goal.clone(),
             };
             if listener_command_tx.send(command).is_ok() {
@@ -435,43 +481,46 @@ impl ThreadGoalRequestProcessor {
     }
 }
 
-fn validate_goal_budget(value: Option<i64>) -> Result<(), String> {
-    if let Some(value) = value
-        && value <= 0
-    {
-        return Err("goal budgets must be positive when provided".to_string());
-    }
-    Ok(())
-}
-
-fn thread_goal_status_to_state(status: ThreadGoalStatus) -> codex_state::ThreadGoalStatus {
-    match status {
-        ThreadGoalStatus::Active => codex_state::ThreadGoalStatus::Active,
-        ThreadGoalStatus::Paused => codex_state::ThreadGoalStatus::Paused,
-        ThreadGoalStatus::BudgetLimited => codex_state::ThreadGoalStatus::BudgetLimited,
-        ThreadGoalStatus::Complete => codex_state::ThreadGoalStatus::Complete,
-    }
-}
-
-fn thread_goal_status_from_state(status: codex_state::ThreadGoalStatus) -> ThreadGoalStatus {
-    match status {
-        codex_state::ThreadGoalStatus::Active => ThreadGoalStatus::Active,
-        codex_state::ThreadGoalStatus::Paused => ThreadGoalStatus::Paused,
-        codex_state::ThreadGoalStatus::BudgetLimited => ThreadGoalStatus::BudgetLimited,
-        codex_state::ThreadGoalStatus::Complete => ThreadGoalStatus::Complete,
-    }
+fn thread_settings_applied_item(
+    thread_id: ThreadId,
+    thread_settings: ThreadSettingsSnapshot,
+) -> RolloutItem {
+    RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(
+        ThreadSettingsAppliedEvent {
+            thread_id: Some(thread_id),
+            thread_settings,
+        },
+    ))
 }
 
 pub(super) fn api_thread_goal_from_state(goal: codex_state::ThreadGoal) -> ThreadGoal {
     ThreadGoal {
         thread_id: goal.thread_id.to_string(),
         objective: goal.objective,
-        status: thread_goal_status_from_state(goal.status),
+        status: api_thread_goal_status_from_state(goal.status),
         token_budget: goal.token_budget,
         tokens_used: goal.tokens_used,
         time_used_seconds: goal.time_used_seconds,
         created_at: goal.created_at.timestamp(),
         updated_at: goal.updated_at.timestamp(),
+    }
+}
+
+fn api_thread_goal_status_from_state(status: codex_state::ThreadGoalStatus) -> ThreadGoalStatus {
+    match status {
+        codex_state::ThreadGoalStatus::Active => ThreadGoalStatus::Active,
+        codex_state::ThreadGoalStatus::Paused => ThreadGoalStatus::Paused,
+        codex_state::ThreadGoalStatus::Blocked => ThreadGoalStatus::Blocked,
+        codex_state::ThreadGoalStatus::UsageLimited => ThreadGoalStatus::UsageLimited,
+        codex_state::ThreadGoalStatus::BudgetLimited => ThreadGoalStatus::BudgetLimited,
+        codex_state::ThreadGoalStatus::Complete => ThreadGoalStatus::Complete,
+    }
+}
+
+fn goal_service_error(err: GoalServiceError) -> JSONRPCErrorError {
+    match err {
+        GoalServiceError::InvalidRequest(message) => invalid_request(message),
+        GoalServiceError::Internal(message) => internal_error(message),
     }
 }
 

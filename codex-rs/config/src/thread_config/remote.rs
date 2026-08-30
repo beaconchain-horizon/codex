@@ -3,17 +3,18 @@ use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::WireApi;
 use codex_protocol::config_types::ModelProviderAuthInfo;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_redacted_string::RedactedString;
 
 use super::SessionThreadConfig;
 use super::ThreadConfigContext;
 use super::ThreadConfigLoadError;
 use super::ThreadConfigLoadErrorCode;
 use super::ThreadConfigLoader;
+use super::ThreadConfigLoaderFuture;
 use super::ThreadConfigSource;
 use super::UserThreadConfig;
 use proto::thread_config_loader_client::ThreadConfigLoaderClient;
@@ -49,10 +50,7 @@ impl RemoteThreadConfigLoader {
                 )
             })
     }
-}
 
-#[async_trait]
-impl ThreadConfigLoader for RemoteThreadConfigLoader {
     async fn load(
         &self,
         context: ThreadConfigContext,
@@ -70,6 +68,15 @@ impl ThreadConfigLoader for RemoteThreadConfigLoader {
             .into_iter()
             .map(thread_config_source_from_proto)
             .collect()
+    }
+}
+
+impl ThreadConfigLoader for RemoteThreadConfigLoader {
+    fn load(
+        &self,
+        context: ThreadConfigContext,
+    ) -> ThreadConfigLoaderFuture<'_, Vec<ThreadConfigSource>> {
+        Box::pin(RemoteThreadConfigLoader::load(self, context))
     }
 }
 
@@ -168,15 +175,15 @@ fn model_provider_from_proto(
         base_url: provider.base_url,
         env_key: provider.env_key,
         env_key_instructions: provider.env_key_instructions,
-        experimental_bearer_token: provider.experimental_bearer_token,
+        experimental_bearer_token: provider.experimental_bearer_token.map(Into::into),
         auth: provider
             .auth
             .map(model_provider_auth_from_proto)
             .transpose()?,
         aws: None,
         wire_api,
-        query_params: provider.query_params.map(|map| map.values),
-        http_headers: provider.http_headers.map(|map| map.values),
+        query_params: provider.query_params.map(redacted_string_map),
+        http_headers: provider.http_headers.map(redacted_string_map),
         env_http_headers: provider.env_http_headers.map(|map| map.values),
         request_max_retries: provider.request_max_retries,
         stream_max_retries: provider.stream_max_retries,
@@ -184,6 +191,7 @@ fn model_provider_from_proto(
         websocket_connect_timeout_ms: provider.websocket_connect_timeout_ms,
         requires_openai_auth: provider.requires_openai_auth,
         supports_websockets: provider.supports_websockets,
+        supports_standalone_web_search: provider.supports_standalone_web_search,
     };
     Ok((id, info))
 }
@@ -211,6 +219,7 @@ fn model_provider_to_proto(
         websocket_connect_timeout_ms,
         requires_openai_auth,
         supports_websockets,
+        supports_standalone_web_search,
     } = provider;
 
     proto::ModelProvider {
@@ -219,18 +228,19 @@ fn model_provider_to_proto(
         base_url,
         env_key,
         env_key_instructions,
-        experimental_bearer_token,
+        experimental_bearer_token: experimental_bearer_token.map(RedactedString::into_inner),
         auth: auth.map(model_provider_auth_to_proto),
         wire_api: proto_wire_api(wire_api).into(),
         query_params: query_params.map(proto_string_map),
         http_headers: http_headers.map(proto_string_map),
-        env_http_headers: env_http_headers.map(proto_string_map),
+        env_http_headers: env_http_headers.map(|values| proto::StringMap { values }),
         request_max_retries,
         stream_max_retries,
         stream_idle_timeout_ms,
         websocket_connect_timeout_ms,
         requires_openai_auth,
         supports_websockets,
+        supports_standalone_web_search,
     }
 }
 
@@ -248,7 +258,7 @@ fn model_provider_auth_from_proto(
 
     Ok(ModelProviderAuthInfo {
         command: auth.command,
-        args: auth.args,
+        args: auth.args.into_iter().map(RedactedString::from).collect(),
         timeout_ms,
         refresh_interval_ms: auth.refresh_interval_ms,
         cwd,
@@ -267,16 +277,28 @@ fn model_provider_auth_to_proto(auth: ModelProviderAuthInfo) -> proto::ModelProv
 
     proto::ModelProviderAuthInfo {
         command,
-        args,
+        args: args.into_iter().map(RedactedString::into_inner).collect(),
         timeout_ms: timeout_ms.get(),
         refresh_interval_ms,
         cwd: cwd.to_string_lossy().into_owned(),
     }
 }
 
+fn redacted_string_map(map: proto::StringMap) -> HashMap<String, RedactedString> {
+    map.values
+        .into_iter()
+        .map(|(name, value)| (name, value.into()))
+        .collect()
+}
+
 #[cfg(test)]
-fn proto_string_map(values: HashMap<String, String>) -> proto::StringMap {
-    proto::StringMap { values }
+fn proto_string_map(values: HashMap<String, RedactedString>) -> proto::StringMap {
+    proto::StringMap {
+        values: values
+            .into_iter()
+            .map(|(name, value)| (name, value.into_inner()))
+            .collect(),
+    }
 }
 
 #[cfg(test)]
@@ -321,8 +343,7 @@ mod tests {
         expected_cwd: String,
     }
 
-    #[tonic::async_trait]
-    impl thread_config_loader_server::ThreadConfigLoader for TestServer {
+    impl TestServer {
         async fn load(
             &self,
             request: Request<proto::LoadThreadConfigRequest>,
@@ -338,6 +359,26 @@ mod tests {
             Ok(Response::new(proto::LoadThreadConfigResponse {
                 sources: self.sources.clone(),
             }))
+        }
+    }
+
+    impl thread_config_loader_server::ThreadConfigLoader for TestServer {
+        fn load<'a, 'async_trait>(
+            &'a self,
+            request: Request<proto::LoadThreadConfigRequest>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<Response<proto::LoadThreadConfigResponse>, Status>,
+                    > + Send
+                    + 'async_trait,
+            >,
+        >
+        where
+            'a: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(TestServer::load(self, request))
         }
     }
 
@@ -394,8 +435,25 @@ mod tests {
 
     #[test]
     fn model_provider_proto_roundtrips_through_domain_type() {
-        let expected = expected_provider();
+        let mut expected = expected_provider();
+        expected.auth = None;
+        expected.experimental_bearer_token = Some("synthetic-provider-token".into());
         let proto = model_provider_to_proto("local", expected.clone());
+        assert!(proto.supports_standalone_web_search);
+        let (id, actual) = model_provider_from_proto(proto).expect("model provider from proto");
+
+        assert_eq!(id, "local");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn model_provider_proto_defaults_standalone_web_search_to_false() {
+        let expected = ModelProviderInfo {
+            supports_standalone_web_search: false,
+            ..expected_provider()
+        };
+        let proto = model_provider_to_proto("local", expected.clone());
+        assert!(!proto.supports_standalone_web_search);
         let (id, actual) = model_provider_from_proto(proto).expect("model provider from proto");
 
         assert_eq!(id, "local");
@@ -448,6 +506,7 @@ mod tests {
                             websocket_connect_timeout_ms: Some(10_000),
                             requires_openai_auth: false,
                             supports_websockets: true,
+                            supports_standalone_web_search: true,
                         }],
                         features: HashMap::from([
                             ("plugins".to_string(), false),
@@ -487,7 +546,7 @@ mod tests {
             experimental_bearer_token: None,
             auth: Some(ModelProviderAuthInfo {
                 command: "token-helper".to_string(),
-                args: vec!["--json".to_string()],
+                args: vec!["--json".into()],
                 timeout_ms: NonZeroU64::new(5_000).expect("non-zero timeout"),
                 refresh_interval_ms: 300_000,
                 cwd: workspace_dir(),
@@ -495,12 +554,9 @@ mod tests {
             wire_api: WireApi::Responses,
             query_params: Some(HashMap::from([(
                 "api-version".to_string(),
-                "2026-04-16".to_string(),
+                "2026-04-16".into(),
             )])),
-            http_headers: Some(HashMap::from([(
-                "X-Test".to_string(),
-                "enabled".to_string(),
-            )])),
+            http_headers: Some(HashMap::from([("X-Test".to_string(), "enabled".into())])),
             env_http_headers: Some(HashMap::from([(
                 "X-Env".to_string(),
                 "LOCAL_HEADER".to_string(),
@@ -511,6 +567,7 @@ mod tests {
             websocket_connect_timeout_ms: Some(10_000),
             requires_openai_auth: false,
             supports_websockets: true,
+            supports_standalone_web_search: true,
             aws: None,
         }
     }

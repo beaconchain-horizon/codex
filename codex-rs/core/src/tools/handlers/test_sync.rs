@@ -12,16 +12,18 @@ use crate::function_tool::FunctionCallError;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
+use crate::tools::context::boxed_tool_output;
 use crate::tools::handlers::parse_arguments;
 use crate::tools::handlers::test_sync_spec::create_test_sync_tool;
-use crate::tools::registry::ToolHandler;
-use crate::tools::registry::ToolKind;
+use crate::tools::registry::CoreToolRuntime;
+use crate::tools::registry::ToolExecutor;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 
 pub struct TestSyncHandler;
 
 const DEFAULT_TIMEOUT_MS: u64 = 1_000;
+const GIT_ENRICHMENT_TIMEOUT: Duration = Duration::from_secs(10);
 
 static BARRIERS: OnceLock<tokio::sync::Mutex<HashMap<String, BarrierState>>> = OnceLock::new();
 
@@ -46,6 +48,8 @@ struct TestSyncArgs {
     sleep_after_ms: Option<u64>,
     #[serde(default)]
     barrier: Option<BarrierArgs>,
+    #[serde(default)]
+    wait_for_git_enrichment: bool,
 }
 
 fn default_timeout_ms() -> u64 {
@@ -56,27 +60,33 @@ fn barrier_map() -> &'static tokio::sync::Mutex<HashMap<String, BarrierState>> {
     BARRIERS.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
 }
 
-impl ToolHandler for TestSyncHandler {
-    type Output = FunctionToolOutput;
-
+impl ToolExecutor<ToolInvocation> for TestSyncHandler {
     fn tool_name(&self) -> ToolName {
         ToolName::plain("test_sync_tool")
     }
 
-    fn spec(&self) -> Option<ToolSpec> {
-        Some(create_test_sync_tool())
+    fn spec(&self) -> ToolSpec {
+        create_test_sync_tool()
     }
 
     fn supports_parallel_tool_calls(&self) -> bool {
         true
     }
 
-    fn kind(&self) -> ToolKind {
-        ToolKind::Function
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
+        Box::pin(self.handle_call(invocation))
     }
+}
 
-    async fn handle(&self, invocation: ToolInvocation) -> Result<Self::Output, FunctionCallError> {
-        let ToolInvocation { payload, .. } = invocation;
+impl TestSyncHandler {
+    async fn handle_call(
+        &self,
+        invocation: ToolInvocation,
+    ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
+        let ToolInvocation { payload, turn, .. } = invocation;
 
         let arguments = match payload {
             ToolPayload::Function { arguments } => arguments,
@@ -99,15 +109,34 @@ impl ToolHandler for TestSyncHandler {
             wait_on_barrier(barrier).await?;
         }
 
+        if args.wait_for_git_enrichment {
+            tokio::time::timeout(
+                GIT_ENRICHMENT_TIMEOUT,
+                turn.turn_metadata_state.wait_for_git_enrichment(),
+            )
+            .await
+            .map_err(|_| {
+                FunctionCallError::RespondToModel(format!(
+                    "test_sync_tool git enrichment wait timed out after {} seconds",
+                    GIT_ENRICHMENT_TIMEOUT.as_secs()
+                ))
+            })?;
+        }
+
         if let Some(delay) = args.sleep_after_ms
             && delay > 0
         {
             sleep(Duration::from_millis(delay)).await;
         }
 
-        Ok(FunctionToolOutput::from_text("ok".to_string(), Some(true)))
+        Ok(boxed_tool_output(FunctionToolOutput::from_text(
+            "ok".to_string(),
+            Some(true),
+        )))
     }
 }
+
+impl CoreToolRuntime for TestSyncHandler {}
 
 async fn wait_on_barrier(args: BarrierArgs) -> Result<(), FunctionCallError> {
     if args.participants == 0 {

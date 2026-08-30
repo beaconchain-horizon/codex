@@ -1,29 +1,31 @@
 use super::*;
+use crate::plugin_bundle_archive::PluginBundlePackError;
+use crate::plugin_bundle_archive::pack_plugin_bundle_tar_gz;
+use codex_http_client::RouteAwareRequestBuilder;
 use codex_login::CodexAuth;
-use codex_login::default_client::build_reqwest_client;
 use codex_utils_absolute_path::AbsolutePathBuf;
-use flate2::Compression;
-use flate2::write::GzEncoder;
-use reqwest::RequestBuilder;
-use reqwest::StatusCode;
+use http::Method;
+use http::StatusCode;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::BTreeMap;
-use std::fmt;
-use std::fs;
 use std::io;
-use std::io::Write;
 use std::path::Path;
 use tracing::warn;
+use url::Url;
 
+mod checkout;
 mod local_paths;
 
 const REMOTE_PLUGIN_SHARE_MAX_ARCHIVE_BYTES: usize = 50 * 1024 * 1024;
+
+pub use checkout::checkout_remote_plugin_share;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemotePluginShareSaveResult {
     pub remote_plugin_id: String,
     pub share_url: Option<String>,
+    pub can_publish_to_workspace: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -43,6 +45,7 @@ pub enum RemotePluginShareDiscoverability {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum RemotePluginShareUpdateDiscoverability {
+    Listed,
     Unlisted,
     Private,
 }
@@ -121,6 +124,8 @@ struct RemoteWorkspacePluginCreateRequest {
 struct RemoteWorkspacePluginCreateResponse {
     plugin_id: String,
     share_url: Option<String>,
+    #[serde(default)]
+    can_publish_to_workspace: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -163,7 +168,7 @@ pub async fn save_remote_plugin_share(
     let etag = upload
         .etag
         .ok_or(RemotePluginCatalogError::MissingUploadEtag)?;
-    put_workspace_plugin_upload(&upload.upload_url, archive_bytes).await?;
+    put_workspace_plugin_upload(config, &upload.upload_url, archive_bytes).await?;
     let share_targets = access_policy.share_targets;
     let share_targets =
         ensure_unlisted_workspace_target(auth, access_policy.discoverability, share_targets)?;
@@ -199,6 +204,7 @@ pub async fn save_remote_plugin_share(
     Ok(RemotePluginShareSaveResult {
         remote_plugin_id: response.plugin_id,
         share_url: response.share_url,
+        can_publish_to_workspace: response.can_publish_to_workspace,
     })
 }
 
@@ -279,8 +285,7 @@ pub async fn delete_remote_plugin_share(
     let auth = ensure_chatgpt_auth(auth)?;
     let base_url = config.chatgpt_base_url.trim_end_matches('/');
     let url = format!("{base_url}/public/plugins/workspace/{remote_plugin_id}");
-    let client = build_reqwest_client();
-    let request = authenticated_request(client.delete(&url), auth)?;
+    let request = authenticated_request(config.http_request(Method::DELETE, &url), auth);
     send_and_expect_status(request, &url, &[StatusCode::NO_CONTENT]).await?;
     if let Err(err) = local_paths::remove_plugin_share_local_path(codex_home, remote_plugin_id) {
         warn!(
@@ -300,6 +305,7 @@ pub async fn update_remote_plugin_share_targets(
 ) -> Result<RemotePluginShareUpdateTargetsResult, RemotePluginCatalogError> {
     let auth = ensure_chatgpt_auth(auth)?;
     let target_discoverability = match discoverability {
+        RemotePluginShareUpdateDiscoverability::Listed => RemotePluginShareDiscoverability::Listed,
         RemotePluginShareUpdateDiscoverability::Unlisted => {
             RemotePluginShareDiscoverability::Unlisted
         }
@@ -312,8 +318,7 @@ pub async fn update_remote_plugin_share_targets(
             .unwrap_or_default();
     let base_url = config.chatgpt_base_url.trim_end_matches('/');
     let url = format!("{base_url}/ps/plugins/{remote_plugin_id}/shares");
-    let client = build_reqwest_client();
-    let request = authenticated_request(client.put(&url), auth)?.json(
+    let request = authenticated_request(config.http_request(Method::PUT, &url), auth).json(
         &RemotePluginShareUpdateTargetsRequest {
             discoverability,
             targets,
@@ -377,13 +382,15 @@ async fn get_created_workspace_plugins_page(
     page_token: Option<&str>,
 ) -> Result<RemotePluginListResponse, RemotePluginCatalogError> {
     let base_url = config.chatgpt_base_url.trim_end_matches('/');
-    let url = format!("{base_url}/ps/plugins/workspace/created");
-    let client = build_reqwest_client();
-    let mut request = authenticated_request(client.get(&url), auth)?;
-    request = request.query(&[("limit", REMOTE_PLUGIN_LIST_PAGE_LIMIT)]);
+    let mut url = Url::parse(&format!("{base_url}/ps/plugins/workspace/created"))
+        .map_err(RemotePluginCatalogError::InvalidBaseUrl)?;
+    url.query_pairs_mut()
+        .append_pair("limit", &REMOTE_PLUGIN_LIST_PAGE_LIMIT.to_string());
     if let Some(page_token) = page_token {
-        request = request.query(&[("pageToken", page_token)]);
+        url.query_pairs_mut().append_pair("pageToken", page_token);
     }
+    let url = url.to_string();
+    let request = authenticated_request(config.http_request(Method::GET, &url), auth);
     send_and_decode(request, &url).await
 }
 
@@ -396,8 +403,7 @@ async fn create_workspace_plugin_upload(
 ) -> Result<RemoteWorkspacePluginUploadUrlResponse, RemotePluginCatalogError> {
     let base_url = config.chatgpt_base_url.trim_end_matches('/');
     let url = format!("{base_url}/public/plugins/workspace/upload-url");
-    let client = build_reqwest_client();
-    let request = authenticated_request(client.post(&url), auth)?.json(
+    let request = authenticated_request(config.http_request(Method::POST, &url), auth).json(
         &RemoteWorkspacePluginUploadUrlRequest {
             filename,
             mime_type: "application/gzip",
@@ -409,12 +415,12 @@ async fn create_workspace_plugin_upload(
 }
 
 async fn put_workspace_plugin_upload(
+    config: &RemotePluginServiceConfig,
     upload_url: &str,
     archive_bytes: Vec<u8>,
 ) -> Result<(), RemotePluginCatalogError> {
-    let client = build_reqwest_client();
-    let request = client
-        .put(upload_url)
+    let request = config
+        .http_request(Method::PUT, upload_url)
         .timeout(REMOTE_PLUGIN_CATALOG_TIMEOUT)
         .header("x-ms-blob-type", "BlockBlob")
         .header("Content-Type", "application/gzip")
@@ -450,8 +456,7 @@ async fn finalize_workspace_plugin_upload(
     } else {
         format!("{base_url}/public/plugins/workspace")
     };
-    let client = build_reqwest_client();
-    let request = authenticated_request(client.post(&url), auth)?.json(&body);
+    let request = authenticated_request(config.http_request(Method::POST, &url), auth).json(&body);
     send_and_decode(request, &url).await
 }
 
@@ -474,142 +479,22 @@ fn archive_plugin_for_upload_with_limit(
     plugin_path: &Path,
     max_bytes: usize,
 ) -> Result<Vec<u8>, RemotePluginCatalogError> {
-    if !plugin_path.is_dir() {
-        return Err(RemotePluginCatalogError::InvalidPluginPath {
+    pack_plugin_bundle_tar_gz(plugin_path, max_bytes).map_err(|err| match err {
+        PluginBundlePackError::InvalidPluginPath { path, reason } => {
+            RemotePluginCatalogError::InvalidPluginPath { path, reason }
+        }
+        PluginBundlePackError::ArchiveTooLarge { bytes, max_bytes } => {
+            RemotePluginCatalogError::ArchiveTooLarge { bytes, max_bytes }
+        }
+        PluginBundlePackError::Io { source } => RemotePluginCatalogError::Archive {
             path: plugin_path.to_path_buf(),
-            reason: "expected a plugin directory".to_string(),
-        });
-    }
-    if !plugin_path.join(".codex-plugin/plugin.json").is_file() {
-        return Err(RemotePluginCatalogError::InvalidPluginPath {
-            path: plugin_path.to_path_buf(),
-            reason: "missing .codex-plugin/plugin.json".to_string(),
-        });
-    }
-
-    let encoder = GzEncoder::new(SizeLimitedBuffer::new(max_bytes), Compression::default());
-    let mut archive = tar::Builder::new(encoder);
-    append_plugin_tree(&mut archive, plugin_path, plugin_path)
-        .map_err(|source| archive_error(plugin_path, source))?;
-    let encoder = archive
-        .into_inner()
-        .map_err(|source| archive_error(plugin_path, source))?;
-    encoder
-        .finish()
-        .map(SizeLimitedBuffer::into_inner)
-        .map_err(|source| archive_error(plugin_path, source))
+            source,
+        },
+    })
 }
-
-fn append_plugin_tree<W: Write>(
-    archive: &mut tar::Builder<W>,
-    plugin_root: &Path,
-    current: &Path,
-) -> io::Result<()> {
-    let mut entries = fs::read_dir(current)?.collect::<Result<Vec<_>, io::Error>>()?;
-    entries.sort_by_key(fs::DirEntry::file_name);
-    for entry in entries {
-        let path = entry.path();
-        let file_type = entry.file_type()?;
-        let relative_path = path.strip_prefix(plugin_root).map_err(|err| {
-            io::Error::other(format!(
-                "failed to compute plugin archive path for `{}`: {err}",
-                path.display()
-            ))
-        })?;
-        if file_type.is_dir() {
-            archive.append_dir(relative_path, &path)?;
-            append_plugin_tree(archive, plugin_root, &path)?;
-        } else if file_type.is_file() {
-            archive.append_path_with_name(&path, relative_path)?;
-        } else {
-            return Err(io::Error::other(format!(
-                "unsupported plugin archive entry type: {}",
-                path.display()
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn archive_error(plugin_path: &Path, source: io::Error) -> RemotePluginCatalogError {
-    if let Some(limit) = source
-        .get_ref()
-        .and_then(|err| err.downcast_ref::<ArchiveSizeLimitExceeded>())
-    {
-        return RemotePluginCatalogError::ArchiveTooLarge {
-            bytes: limit.bytes,
-            max_bytes: limit.max_bytes,
-        };
-    }
-
-    RemotePluginCatalogError::Archive {
-        path: plugin_path.to_path_buf(),
-        source,
-    }
-}
-
-struct SizeLimitedBuffer {
-    bytes: Vec<u8>,
-    max_bytes: usize,
-}
-
-impl SizeLimitedBuffer {
-    fn new(max_bytes: usize) -> Self {
-        Self {
-            bytes: Vec::new(),
-            max_bytes,
-        }
-    }
-
-    fn into_inner(self) -> Vec<u8> {
-        self.bytes
-    }
-}
-
-impl Write for SizeLimitedBuffer {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let next_len = self.bytes.len().checked_add(buf.len()).ok_or_else(|| {
-            io::Error::other(ArchiveSizeLimitExceeded {
-                bytes: usize::MAX,
-                max_bytes: self.max_bytes,
-            })
-        })?;
-        if next_len > self.max_bytes {
-            return Err(io::Error::other(ArchiveSizeLimitExceeded {
-                bytes: next_len,
-                max_bytes: self.max_bytes,
-            }));
-        }
-
-        self.bytes.extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-#[derive(Debug)]
-struct ArchiveSizeLimitExceeded {
-    bytes: usize,
-    max_bytes: usize,
-}
-
-impl fmt::Display for ArchiveSizeLimitExceeded {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "archive would be {} bytes, exceeding maximum size of {} bytes",
-            self.bytes, self.max_bytes
-        )
-    }
-}
-
-impl std::error::Error for ArchiveSizeLimitExceeded {}
 
 async fn send_and_expect_status(
-    request: RequestBuilder,
+    request: RouteAwareRequestBuilder,
     url_for_error: &str,
     expected_statuses: &[StatusCode],
 ) -> Result<(), RemotePluginCatalogError> {

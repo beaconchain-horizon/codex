@@ -1,9 +1,11 @@
 mod backend;
 mod client;
 mod managed_install;
+mod remote_control_client;
 mod settings;
 mod update_loop;
 
+use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -12,8 +14,10 @@ use anyhow::Result;
 use anyhow::anyhow;
 pub use backend::BackendKind;
 use backend::BackendPaths;
+use codex_app_server_protocol::RemoteControlConnectionStatus;
+use codex_app_server_protocol::RemoteControlPairingStartResponse;
 use codex_app_server_transport::app_server_control_socket_path;
-use codex_core::config::find_codex_home;
+use codex_utils_home_dir::find_codex_home;
 use managed_install::managed_codex_bin;
 #[cfg(unix)]
 use managed_install::managed_codex_version;
@@ -57,6 +61,8 @@ pub struct LifecycleOutput {
     pub backend: Option<BackendKind>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
+    pub managed_codex_path: PathBuf,
+    pub managed_codex_version: Option<String>,
     pub socket_path: PathBuf,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cli_version: Option<String>,
@@ -67,6 +73,12 @@ pub struct LifecycleOutput {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BootstrapOptions {
     pub remote_control_enabled: bool,
+}
+
+/// Passively probes an existing app-server socket and returns its reported
+/// app-server version.
+pub async fn probe_app_server_version(socket_path: &Path) -> Result<String> {
+    Ok(client::probe(socket_path).await?.app_server_version)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -83,9 +95,31 @@ pub struct BootstrapOutput {
     pub auto_update_enabled: bool,
     pub remote_control_enabled: bool,
     pub managed_codex_path: PathBuf,
+    pub managed_codex_version: Option<String>,
     pub socket_path: PathBuf,
     pub cli_version: String,
     pub app_server_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum RemoteControlStartOutput {
+    Bootstrap(BootstrapOutput),
+    Start(LifecycleOutput),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteControlReadyStatus {
+    pub status: RemoteControlConnectionStatus,
+    pub server_name: String,
+    pub environment_id: Option<String>,
+    pub timed_out: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteControlReadyOutput {
+    pub daemon: RemoteControlStartOutput,
+    pub remote_control: RemoteControlReadyStatus,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,9 +157,35 @@ pub struct RemoteControlOutput {
 }
 
 #[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RestartIfRunningOutcome {
-    Completed,
     Busy,
+    NotRunning,
+    NotReady,
+    AlreadyCurrent,
+    Restarted,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RestartMode {
+    IfVersionChanged,
+    Always,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UpdaterRefreshMode {
+    None,
+    ReexecIfManagedBinaryChanged,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestartDecision {
+    NotReady,
+    AlreadyCurrent,
+    Restart,
 }
 
 pub async fn run(command: LifecycleCommand) -> Result<LifecycleOutput> {
@@ -138,14 +198,44 @@ pub async fn bootstrap(options: BootstrapOptions) -> Result<BootstrapOutput> {
     Daemon::from_environment()?.bootstrap(options).await
 }
 
+pub async fn ensure_remote_control_ready() -> Result<RemoteControlReadyOutput> {
+    ensure_supported_platform()?;
+    Daemon::from_environment()?
+        .ensure_remote_control_ready()
+        .await
+}
+
+pub async fn enable_remote_control_on_socket(
+    socket_path: &Path,
+    connect_timeout: Duration,
+    connect_retry_delay: Duration,
+) -> Result<RemoteControlReadyStatus> {
+    ensure_supported_platform()?;
+    remote_control_client::enable_remote_control_with_connect_retry(
+        socket_path,
+        connect_timeout,
+        connect_retry_delay,
+    )
+    .await
+}
+
+/// Starts a manual pairing session through an already-running daemon app-server.
+pub async fn start_remote_control_pairing() -> Result<RemoteControlPairingStartResponse> {
+    ensure_supported_platform()?;
+    let daemon = Daemon::from_environment()?;
+    remote_control_client::start_pairing(&daemon.socket_path).await
+}
+
 pub async fn set_remote_control(mode: RemoteControlMode) -> Result<RemoteControlOutput> {
     ensure_supported_platform()?;
     Daemon::from_environment()?.set_remote_control(mode).await
 }
 
-pub async fn run_pid_update_loop() -> Result<()> {
+pub async fn run_pid_update_loop(
+    http_client_factory: codex_http_client::HttpClientFactory,
+) -> Result<()> {
     ensure_supported_platform()?;
-    update_loop::run().await
+    update_loop::run(http_client_factory).await
 }
 
 #[cfg(unix)]
@@ -207,33 +297,39 @@ impl Daemon {
     async fn start(&self) -> Result<LifecycleOutput> {
         let settings = self.load_settings().await?;
         if let Ok(info) = client::probe(&self.socket_path).await {
-            return Ok(self.output(
-                LifecycleStatus::AlreadyRunning,
-                self.running_backend(&settings).await?,
-                /*pid*/ None,
-                Some(info.app_server_version),
-            ));
+            return Ok(self
+                .output(
+                    LifecycleStatus::AlreadyRunning,
+                    self.running_backend(&settings).await?,
+                    /*pid*/ None,
+                    Some(info.app_server_version),
+                )
+                .await);
         }
 
         if self.running_backend_instance(&settings).await?.is_some() {
             let info = self.wait_until_ready().await?;
-            return Ok(self.output(
-                LifecycleStatus::AlreadyRunning,
-                Some(BackendKind::Pid),
-                /*pid*/ None,
-                Some(info.app_server_version),
-            ));
+            return Ok(self
+                .output(
+                    LifecycleStatus::AlreadyRunning,
+                    Some(BackendKind::Pid),
+                    /*pid*/ None,
+                    Some(info.app_server_version),
+                )
+                .await);
         }
 
         self.ensure_managed_codex_bin()?;
         let pid = self.start_managed_backend(&settings).await?;
         let info = self.wait_until_ready().await?;
-        Ok(self.output(
-            LifecycleStatus::Started,
-            Some(BackendKind::Pid),
-            pid,
-            Some(info.app_server_version),
-        ))
+        Ok(self
+            .output(
+                LifecycleStatus::Started,
+                Some(BackendKind::Pid),
+                pid,
+                Some(info.app_server_version),
+            )
+            .await)
     }
 
     async fn restart(&self) -> Result<LifecycleOutput> {
@@ -253,54 +349,74 @@ impl Daemon {
 
         let pid = self.start_managed_backend(&settings).await?;
         let info = self.wait_until_ready().await?;
-        Ok(self.output(
-            LifecycleStatus::Restarted,
-            Some(BackendKind::Pid),
-            pid,
-            Some(info.app_server_version),
-        ))
+        Ok(self
+            .output(
+                LifecycleStatus::Restarted,
+                Some(BackendKind::Pid),
+                pid,
+                Some(info.app_server_version),
+            )
+            .await)
     }
 
     #[cfg(unix)]
-    pub(crate) async fn try_restart_if_running(&self) -> Result<RestartIfRunningOutcome> {
+    pub(crate) async fn try_restart_if_running(
+        &self,
+        mode: RestartMode,
+        updater_refresh_mode: UpdaterRefreshMode,
+        managed_codex_bin: &Path,
+    ) -> Result<RestartIfRunningOutcome> {
         let operation_lock = self.open_operation_lock_file().await?;
         if !try_lock_file(&operation_lock)? {
             return Ok(RestartIfRunningOutcome::Busy);
         }
         let settings = self.load_settings().await?;
-        if let Some(backend) = self.running_backend_instance(&settings).await? {
-            let Ok(info) = client::probe(&self.socket_path).await else {
-                return Ok(RestartIfRunningOutcome::Completed);
+        let outcome = if let Some(backend) = self.running_backend_instance(&settings).await? {
+            let info = client::probe(&self.socket_path).await.ok();
+            let managed_version = if info.is_some() {
+                Some(managed_codex_version(managed_codex_bin).await?)
+            } else {
+                None
             };
-            let managed_version = managed_codex_version(&self.managed_codex_bin).await?;
-            if info.app_server_version == managed_version {
-                return Ok(RestartIfRunningOutcome::Completed);
+            match restart_decision(mode, info.as_ref(), managed_version.as_deref()) {
+                RestartDecision::NotReady => return Ok(RestartIfRunningOutcome::NotReady),
+                RestartDecision::AlreadyCurrent => RestartIfRunningOutcome::AlreadyCurrent,
+                RestartDecision::Restart => {
+                    backend.stop().await?;
+                    let _ = self
+                        .start_managed_backend_with_bin(&settings, managed_codex_bin)
+                        .await?;
+                    self.wait_until_ready().await?;
+                    RestartIfRunningOutcome::Restarted
+                }
             }
-            backend.stop().await?;
-            let _ = self.start_managed_backend(&settings).await?;
-            self.wait_until_ready().await?;
-            return Ok(RestartIfRunningOutcome::Completed);
-        }
-
-        if client::probe(&self.socket_path).await.is_ok() {
+        } else if client::probe(&self.socket_path).await.is_ok() {
             return Err(anyhow!(
                 "app server is running but is not managed by codex app-server daemon"
             ));
+        } else {
+            RestartIfRunningOutcome::NotRunning
+        };
+
+        if should_reexec_updater(updater_refresh_mode, outcome) {
+            crate::update_loop::reexec_managed_updater(managed_codex_bin)?;
         }
 
-        Ok(RestartIfRunningOutcome::Completed)
+        Ok(outcome)
     }
 
     async fn stop(&self) -> Result<LifecycleOutput> {
         let settings = self.load_settings().await?;
         if let Some(backend) = self.running_backend_instance(&settings).await? {
             backend.stop().await?;
-            return Ok(self.output(
-                LifecycleStatus::Stopped,
-                Some(BackendKind::Pid),
-                /*pid*/ None,
-                /*app_server_version*/ None,
-            ));
+            return Ok(self
+                .output(
+                    LifecycleStatus::Stopped,
+                    Some(BackendKind::Pid),
+                    /*pid*/ None,
+                    /*app_server_version*/ None,
+                )
+                .await);
         }
 
         if client::probe(&self.socket_path).await.is_ok() {
@@ -309,23 +425,27 @@ impl Daemon {
             ));
         }
 
-        Ok(self.output(
-            LifecycleStatus::NotRunning,
-            /*backend*/ None,
-            /*pid*/ None,
-            /*app_server_version*/ None,
-        ))
+        Ok(self
+            .output(
+                LifecycleStatus::NotRunning,
+                /*backend*/ None,
+                /*pid*/ None,
+                /*app_server_version*/ None,
+            )
+            .await)
     }
 
     async fn version(&self) -> Result<LifecycleOutput> {
         let settings = self.load_settings().await?;
         let info = client::probe(&self.socket_path).await?;
-        Ok(self.output(
-            LifecycleStatus::Running,
-            self.running_backend(&settings).await?,
-            /*pid*/ None,
-            Some(info.app_server_version),
-        ))
+        Ok(self
+            .output(
+                LifecycleStatus::Running,
+                self.running_backend(&settings).await?,
+                /*pid*/ None,
+                Some(info.app_server_version),
+            )
+            .await)
     }
 
     async fn wait_until_ready(&self) -> Result<client::ProbeInfo> {
@@ -338,15 +458,32 @@ impl Daemon {
                     sleep(START_POLL_INTERVAL).await;
                 }
                 Err(err) => {
-                    return Err(err).with_context(|| {
-                        format!(
-                            "app server did not become ready on {}",
-                            self.socket_path.display()
-                        )
-                    });
+                    let context = self.app_server_not_ready_context().await;
+                    return Err(err).context(context);
                 }
             }
         }
+    }
+
+    async fn app_server_not_ready_context(&self) -> String {
+        let mut context = format!(
+            "app server did not become ready on {}",
+            self.socket_path.display()
+        );
+        self.append_daemon_app_server_context(&mut context).await;
+        backend::append_stderr_log_tail_context(&self.pid_file, &mut context).await;
+        context
+    }
+
+    async fn append_daemon_app_server_context(&self, context: &mut String) {
+        let managed_codex_version = self
+            .managed_codex_version_best_effort()
+            .await
+            .unwrap_or_else(|| "unknown".to_string());
+        context.push_str(&format!(
+            "\n\nDaemon used app-server:\n  path: {}\n  version: {managed_codex_version}",
+            self.managed_codex_bin.display()
+        ));
     }
 
     async fn bootstrap(&self, options: BootstrapOptions) -> Result<BootstrapOutput> {
@@ -354,8 +491,44 @@ impl Daemon {
         self.bootstrap_locked(options).await
     }
 
+    async fn ensure_remote_control_started(&self) -> Result<RemoteControlStartOutput> {
+        let _operation_lock = self.acquire_operation_lock().await?;
+        let settings = self.load_settings().await?;
+        if self.is_bootstrapped(&settings).await? {
+            let _ = self
+                .set_remote_control_locked(RemoteControlMode::Enabled)
+                .await?;
+            let output = self.start().await?;
+            return Ok(RemoteControlStartOutput::Start(output));
+        }
+
+        let output = self
+            .bootstrap_locked(BootstrapOptions {
+                remote_control_enabled: true,
+            })
+            .await?;
+        Ok(RemoteControlStartOutput::Bootstrap(output))
+    }
+
+    async fn ensure_remote_control_ready(&self) -> Result<RemoteControlReadyOutput> {
+        let daemon = self.ensure_remote_control_started().await?;
+        let remote_control =
+            remote_control_client::enable_remote_control(&self.socket_path).await?;
+        Ok(RemoteControlReadyOutput {
+            daemon,
+            remote_control,
+        })
+    }
+
     async fn set_remote_control(&self, mode: RemoteControlMode) -> Result<RemoteControlOutput> {
         let _operation_lock = self.acquire_operation_lock().await?;
+        self.set_remote_control_locked(mode).await
+    }
+
+    async fn set_remote_control_locked(
+        &self,
+        mode: RemoteControlMode,
+    ) -> Result<RemoteControlOutput> {
         let previous_settings = self.load_settings().await?;
         let mut settings = previous_settings.clone();
         let remote_control_enabled = mode.is_enabled();
@@ -373,6 +546,16 @@ impl Daemon {
             } else {
                 None
             };
+            if info.is_some() {
+                match mode {
+                    RemoteControlMode::Enabled => {
+                        remote_control_client::enable_remote_control(&self.socket_path).await?;
+                    }
+                    RemoteControlMode::Disabled => {
+                        remote_control_client::disable_remote_control(&self.socket_path).await?;
+                    }
+                }
+            }
             return Ok(self.remote_control_output(
                 already_remote_control_status(mode),
                 backend.map(|_| BackendKind::Pid),
@@ -429,12 +612,14 @@ impl Daemon {
         updater.start().await?;
 
         let info = self.wait_until_ready().await?;
+        let managed_codex_version = self.managed_codex_version_best_effort().await;
         Ok(BootstrapOutput {
             status: BootstrapStatus::Bootstrapped,
             backend: BackendKind::Pid,
             auto_update_enabled: true,
             remote_control_enabled: settings.remote_control_enabled,
             managed_codex_path: self.managed_codex_bin.clone(),
+            managed_codex_version,
             socket_path: self.socket_path.clone(),
             cli_version: env!("CARGO_PKG_VERSION").to_string(),
             app_server_version: info.app_server_version,
@@ -460,8 +645,23 @@ impl Daemon {
     }
 
     async fn start_managed_backend(&self, settings: &DaemonSettings) -> Result<Option<u32>> {
-        let backend = backend::pid_backend(self.backend_paths(settings));
+        self.start_managed_backend_with_bin(settings, &self.managed_codex_bin)
+            .await
+    }
+
+    async fn start_managed_backend_with_bin(
+        &self,
+        settings: &DaemonSettings,
+        managed_codex_bin: &Path,
+    ) -> Result<Option<u32>> {
+        let backend =
+            backend::pid_backend(self.backend_paths_with_bin(settings, managed_codex_bin));
         backend.start().await
+    }
+
+    async fn is_bootstrapped(&self, settings: &DaemonSettings) -> Result<bool> {
+        let updater = backend::pid_update_loop_backend(self.backend_paths(settings));
+        updater.is_starting_or_running().await
     }
 
     fn ensure_managed_codex_bin(&self) -> Result<()> {
@@ -469,15 +669,37 @@ impl Daemon {
             return Ok(());
         }
 
+        let managed_codex_path = self.managed_codex_bin.display();
         Err(anyhow!(
-            "managed standalone Codex install not found at {}; install Codex first",
-            self.managed_codex_bin.display()
+            "managed standalone Codex install not found at {managed_codex_path}\n\n\
+             This command requires the standalone install managed by the Codex installer, because \
+             the daemon starts and updates app-server from that fixed path.\n\n\
+             Install it with:\n  curl -fsSL https://chatgpt.com/codex/install.sh | sh\n\n\
+             Then rerun the command you just tried."
         ))
     }
 
+    #[cfg(unix)]
+    async fn managed_codex_version_best_effort(&self) -> Option<String> {
+        managed_codex_version(&self.managed_codex_bin).await.ok()
+    }
+
+    #[cfg(not(unix))]
+    async fn managed_codex_version_best_effort(&self) -> Option<String> {
+        None
+    }
+
     fn backend_paths(&self, settings: &DaemonSettings) -> BackendPaths {
+        self.backend_paths_with_bin(settings, &self.managed_codex_bin)
+    }
+
+    fn backend_paths_with_bin(
+        &self,
+        settings: &DaemonSettings,
+        managed_codex_bin: &Path,
+    ) -> BackendPaths {
         BackendPaths {
-            codex_bin: self.managed_codex_bin.clone(),
+            codex_bin: managed_codex_bin.to_path_buf(),
             pid_file: self.pid_file.clone(),
             update_pid_file: self.update_pid_file.clone(),
             remote_control_enabled: settings.remote_control_enabled,
@@ -526,17 +748,20 @@ impl Daemon {
             })
     }
 
-    fn output(
+    async fn output(
         &self,
         status: LifecycleStatus,
         backend: Option<BackendKind>,
         pid: Option<u32>,
         app_server_version: Option<String>,
     ) -> LifecycleOutput {
+        let managed_codex_version = self.managed_codex_version_best_effort().await;
         LifecycleOutput {
             status,
             backend,
             pid,
+            managed_codex_path: self.managed_codex_bin.clone(),
+            managed_codex_version,
             socket_path: self.socket_path.clone(),
             cli_version: Some(env!("CARGO_PKG_VERSION").to_string()),
             app_server_version,
@@ -576,6 +801,32 @@ fn already_remote_control_status(mode: RemoteControlMode) -> RemoteControlStatus
 }
 
 #[cfg(unix)]
+fn restart_decision(
+    mode: RestartMode,
+    info: Option<&client::ProbeInfo>,
+    managed_version: Option<&str>,
+) -> RestartDecision {
+    match (mode, info, managed_version) {
+        (RestartMode::IfVersionChanged, None, _) => RestartDecision::NotReady,
+        (RestartMode::IfVersionChanged, Some(info), Some(managed_version))
+            if info.app_server_version == managed_version =>
+        {
+            RestartDecision::AlreadyCurrent
+        }
+        _ => RestartDecision::Restart,
+    }
+}
+
+#[cfg(unix)]
+fn should_reexec_updater(
+    updater_refresh_mode: UpdaterRefreshMode,
+    outcome: RestartIfRunningOutcome,
+) -> bool {
+    updater_refresh_mode == UpdaterRefreshMode::ReexecIfManagedBinaryChanged
+        && outcome == RestartIfRunningOutcome::Restarted
+}
+
+#[cfg(unix)]
 fn try_lock_file(file: &tokio::fs::File) -> Result<bool> {
     use std::os::fd::AsRawFd;
 
@@ -599,32 +850,188 @@ fn try_lock_file(_file: &tokio::fs::File) -> Result<bool> {
 #[cfg(all(test, unix))]
 mod tests {
     use pretty_assertions::assert_eq;
+    use tempfile::TempDir;
 
+    use super::BackendKind;
+    use super::BootstrapOutput;
     use super::BootstrapStatus;
+    use super::Daemon;
+    use super::LifecycleOutput;
     use super::LifecycleStatus;
+    use super::RemoteControlStartOutput;
     use super::RemoteControlStatus;
-
-    #[test]
-    fn lifecycle_status_uses_camel_case_json() {
-        assert_eq!(
-            serde_json::to_string(&LifecycleStatus::AlreadyRunning).expect("serialize"),
-            "\"alreadyRunning\""
-        );
-    }
-
-    #[test]
-    fn bootstrap_status_uses_camel_case_json() {
-        assert_eq!(
-            serde_json::to_string(&BootstrapStatus::Bootstrapped).expect("serialize"),
-            "\"bootstrapped\""
-        );
-    }
+    use super::RestartDecision;
+    use super::RestartIfRunningOutcome;
+    use super::RestartMode;
+    use super::UpdaterRefreshMode;
+    use super::restart_decision;
+    use super::should_reexec_updater;
+    use crate::client::ProbeInfo;
 
     #[test]
     fn remote_control_status_uses_camel_case_json() {
         assert_eq!(
             serde_json::to_string(&RemoteControlStatus::AlreadyEnabled).expect("serialize"),
             "\"alreadyEnabled\""
+        );
+    }
+
+    #[test]
+    fn updater_reexec_waits_for_validated_restart() {
+        assert_eq!(
+            [
+                RestartIfRunningOutcome::Busy,
+                RestartIfRunningOutcome::NotReady,
+                RestartIfRunningOutcome::AlreadyCurrent,
+                RestartIfRunningOutcome::NotRunning,
+                RestartIfRunningOutcome::Restarted,
+            ]
+            .map(|outcome| {
+                should_reexec_updater(UpdaterRefreshMode::ReexecIfManagedBinaryChanged, outcome)
+            }),
+            [false, false, false, false, true]
+        );
+    }
+
+    #[test]
+    fn unchanged_updater_never_reexecs() {
+        assert_eq!(
+            [
+                RestartIfRunningOutcome::Busy,
+                RestartIfRunningOutcome::NotReady,
+                RestartIfRunningOutcome::AlreadyCurrent,
+                RestartIfRunningOutcome::NotRunning,
+                RestartIfRunningOutcome::Restarted,
+            ]
+            .map(|outcome| should_reexec_updater(UpdaterRefreshMode::None, outcome)),
+            [false, false, false, false, false]
+        );
+    }
+
+    #[test]
+    fn restart_decision_preserves_forced_refreshes() {
+        let current_info = ProbeInfo {
+            app_server_version: "0.1.0".to_string(),
+        };
+
+        assert_eq!(
+            [
+                restart_decision(
+                    RestartMode::IfVersionChanged,
+                    Some(&current_info),
+                    Some("0.1.0"),
+                ),
+                restart_decision(
+                    RestartMode::IfVersionChanged,
+                    /*info*/ None,
+                    /*managed_version*/ None,
+                ),
+                restart_decision(RestartMode::Always, Some(&current_info), Some("0.1.0")),
+                restart_decision(
+                    RestartMode::Always,
+                    /*info*/ None,
+                    /*managed_version*/ None,
+                ),
+            ],
+            [
+                RestartDecision::AlreadyCurrent,
+                RestartDecision::NotReady,
+                RestartDecision::Restart,
+                RestartDecision::Restart,
+            ]
+        );
+    }
+
+    #[test]
+    fn remote_control_start_output_serializes_inner_output_without_tag() {
+        let lifecycle_output = LifecycleOutput {
+            status: LifecycleStatus::AlreadyRunning,
+            backend: Some(BackendKind::Pid),
+            pid: None,
+            managed_codex_path: "codex".into(),
+            managed_codex_version: Some("1.2.3".to_string()),
+            socket_path: "codex.sock".into(),
+            cli_version: Some("1.2.3".to_string()),
+            app_server_version: Some("1.2.4".to_string()),
+        };
+        let output = RemoteControlStartOutput::Start(lifecycle_output.clone());
+
+        assert_eq!(
+            serde_json::to_value(&lifecycle_output).expect("serialize"),
+            serde_json::json!({
+                "status": "alreadyRunning",
+                "backend": "pid",
+                "managedCodexPath": "codex",
+                "managedCodexVersion": "1.2.3",
+                "socketPath": "codex.sock",
+                "cliVersion": "1.2.3",
+                "appServerVersion": "1.2.4",
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(output).expect("serialize"),
+            serde_json::to_value(lifecycle_output).expect("serialize")
+        );
+
+        let bootstrap_output = BootstrapOutput {
+            status: BootstrapStatus::Bootstrapped,
+            backend: BackendKind::Pid,
+            auto_update_enabled: true,
+            remote_control_enabled: true,
+            managed_codex_path: "codex".into(),
+            managed_codex_version: Some("1.2.3".to_string()),
+            socket_path: "codex.sock".into(),
+            cli_version: "1.2.3".to_string(),
+            app_server_version: "1.2.4".to_string(),
+        };
+        let output = RemoteControlStartOutput::Bootstrap(bootstrap_output.clone());
+
+        assert_eq!(
+            serde_json::to_value(&bootstrap_output).expect("serialize"),
+            serde_json::json!({
+                "status": "bootstrapped",
+                "backend": "pid",
+                "autoUpdateEnabled": true,
+                "remoteControlEnabled": true,
+                "managedCodexPath": "codex",
+                "managedCodexVersion": "1.2.3",
+                "socketPath": "codex.sock",
+                "cliVersion": "1.2.3",
+                "appServerVersion": "1.2.4",
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(output).expect("serialize"),
+            serde_json::to_value(bootstrap_output).expect("serialize")
+        );
+    }
+
+    #[tokio::test]
+    async fn not_ready_context_reports_daemon_app_server_before_stderr() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let daemon = Daemon {
+            socket_path: temp_dir.path().join("app-server-control.sock"),
+            pid_file: temp_dir.path().join("app-server.pid"),
+            update_pid_file: temp_dir.path().join("app-server-updater.pid"),
+            operation_lock_file: temp_dir.path().join("daemon.lock"),
+            settings_file: temp_dir.path().join("settings.json"),
+            managed_codex_bin: temp_dir.path().join("missing-codex"),
+        };
+        let stderr_log = daemon.pid_file.with_extension("stderr.log");
+        tokio::fs::write(&stderr_log, "unexpected argument")
+            .await
+            .expect("write stderr log");
+
+        assert_eq!(
+            daemon.app_server_not_ready_context().await,
+            format!(
+                "app server did not become ready on {}\n\n\
+                 Daemon used app-server:\n  path: {}\n  version: unknown\n\n\
+                 Managed app-server stderr ({}):\n  unexpected argument",
+                daemon.socket_path.display(),
+                daemon.managed_codex_bin.display(),
+                stderr_log.display()
+            )
         );
     }
 }

@@ -13,7 +13,7 @@ use super::*;
 use crate::message_processor::ConnectionSessionState;
 use crate::message_processor::InitializedConnectionSessionState;
 
-const DAEMON_PROBE_CLIENT_NAME: &str = "codex_app_server_daemon";
+const NON_ORIGINATING_CLIENT_NAMES: &[&str] = &["codex_app_server_daemon", "codex-backend"];
 
 #[derive(Clone)]
 pub(crate) struct InitializeRequestProcessor {
@@ -67,17 +67,17 @@ impl InitializeRequestProcessor {
         // experimental API). Proposed direction is instance-global first-write-wins
         // with initialize-time mismatch rejection.
         let analytics_initialize_params = params.clone();
-        let (experimental_api_enabled, request_attestation, opt_out_notification_methods) =
-            match params.capabilities {
-                Some(capabilities) => (
-                    capabilities.experimental_api,
-                    capabilities.request_attestation,
-                    capabilities
-                        .opt_out_notification_methods
-                        .unwrap_or_default(),
-                ),
-                None => (false, false, Vec::new()),
-            };
+        let capabilities = params.capabilities.unwrap_or_default();
+        let experimental_api_enabled = capabilities.experimental_api;
+        let request_attestation = capabilities.request_attestation;
+        let extensions = capabilities.extensions.as_ref();
+        let client_mcp_extensions = codex_mcp::client_mcp_extensions(
+            extensions,
+            capabilities.mcp_server_openai_form_elicitation,
+        );
+        let opt_out_notification_methods = capabilities
+            .opt_out_notification_methods
+            .unwrap_or_default();
         let ClientInfo {
             name,
             title: _title,
@@ -92,7 +92,7 @@ impl InitializeRequestProcessor {
         }
         let originator = name.clone();
         let user_agent_suffix = format!("{name}; {version}");
-        let mutates_global_identity = name != DAEMON_PROBE_CLIENT_NAME;
+        let mutates_global_identity = !NON_ORIGINATING_CLIENT_NAMES.contains(&name.as_str());
         let codex_home = self.config.codex_home.clone();
         if session
             .initialize(InitializedConnectionSessionState {
@@ -101,6 +101,7 @@ impl InitializeRequestProcessor {
                 app_server_client_name: name.clone(),
                 client_version: version,
                 request_attestation,
+                client_mcp_extensions,
             })
             .is_err()
         {

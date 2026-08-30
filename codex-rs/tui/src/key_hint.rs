@@ -5,6 +5,12 @@
 //! cross-terminal inconsistencies in how shifted letters and raw C0 control
 //! characters are reported.
 //!
+//! List and picker code should match navigation through these helpers instead
+//! of comparing `KeyEvent` values directly. The matcher owns compatibility for
+//! terminals that report control chords as C0 characters, while
+//! `is_plain_text_key_event` gives searchable pickers a shared boundary between
+//! text input and navigation commands.
+//!
 //! It also supplies rendering helpers that convert bindings into styled
 //! `ratatui::text::Span` values for UI hint display.
 
@@ -13,7 +19,6 @@ use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
 use crossterm::event::KeyModifiers;
 use ratatui::style::Style;
-use ratatui::style::Stylize;
 use ratatui::text::Span;
 
 #[cfg(test)]
@@ -38,6 +43,37 @@ const SHIFT_PREFIX: &str = "shift + ";
 pub(crate) struct KeyBinding {
     key: KeyCode,
     modifiers: KeyModifiers,
+}
+
+/// A user-visible shortcut made from one key or a two-key chord.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum ShortcutHint {
+    Single(KeyBinding),
+    Chord {
+        prefix: KeyBinding,
+        completion: KeyBinding,
+    },
+}
+
+impl ShortcutHint {
+    pub(crate) fn display_label(self) -> String {
+        match self {
+            Self::Single(binding) => binding.display_label(),
+            Self::Chord { prefix, completion } => {
+                format!("{} {}", prefix.display_label(), completion.display_label())
+            }
+        }
+    }
+
+    pub(crate) fn is_press(self, event: KeyEvent) -> bool {
+        matches!(self, Self::Single(binding) if binding.is_press(event))
+    }
+}
+
+impl From<KeyBinding> for ShortcutHint {
+    fn from(binding: KeyBinding) -> Self {
+        Self::Single(binding)
+    }
 }
 
 impl KeyBinding {
@@ -122,6 +158,27 @@ impl KeyBindingListExt for [KeyBinding] {
     }
 }
 
+/// Returns whether an event should be treated as literal text input.
+///
+/// Searchable pickers use this to avoid stealing plain printable characters for
+/// navigation when the same character might be a valid query. For example, a
+/// list may bind `j` and `k` for movement, but a searchable list must let
+/// plain `j` update the query while still allowing `Ctrl+J` to move. Calling
+/// this after normalizing keybindings would blur that distinction and cause
+/// printable search input to disappear.
+pub(crate) fn is_plain_text_key_event(event: KeyEvent) -> bool {
+    matches!(
+        event,
+        KeyEvent {
+            code: KeyCode::Char(ch),
+            modifiers,
+            ..
+        } if !ch.is_ascii_control()
+            && !modifiers.contains(KeyModifiers::CONTROL)
+            && !modifiers.contains(KeyModifiers::ALT)
+    )
+}
+
 pub(crate) const fn plain(key: KeyCode) -> KeyBinding {
     KeyBinding::new(key, KeyModifiers::NONE)
 }
@@ -164,6 +221,12 @@ impl From<KeyBinding> for Span<'static> {
 impl From<&KeyBinding> for Span<'static> {
     fn from(binding: &KeyBinding) -> Self {
         Span::styled(binding.display_label(), key_hint_style())
+    }
+}
+
+impl From<ShortcutHint> for Span<'static> {
+    fn from(hint: ShortcutHint) -> Self {
+        Span::styled(hint.display_label(), key_hint_style())
     }
 }
 

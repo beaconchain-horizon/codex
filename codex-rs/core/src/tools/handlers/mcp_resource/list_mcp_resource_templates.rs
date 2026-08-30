@@ -1,62 +1,57 @@
-use std::time::Instant;
-
 use crate::function_tool::FunctionCallError;
-use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::handlers::mcp_resource_spec::create_list_mcp_resource_templates_tool;
-use crate::tools::registry::ToolHandler;
-use crate::tools::registry::ToolKind;
-use codex_protocol::models::function_call_output_content_items_to_text;
+use crate::tools::registry::CoreToolRuntime;
+use crate::tools::registry::ToolExecutor;
 use codex_protocol::protocol::McpInvocation;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 
-use rmcp::model::PaginatedRequestParams;
-
-use super::ListResourceTemplatesArgs;
+use super::ListResourceArgs;
 use super::ListResourceTemplatesPayload;
-use super::call_tool_result_from_content;
-use super::emit_tool_call_begin;
-use super::emit_tool_call_end;
-use super::normalize_optional_string;
+use super::model_can_access_mcp_server;
 use super::parse_args_with_default;
 use super::parse_arguments;
-use super::serialize_function_output;
+use super::run_resource_operation;
 
 pub struct ListMcpResourceTemplatesHandler;
 
-impl ToolHandler for ListMcpResourceTemplatesHandler {
-    type Output = FunctionToolOutput;
-
+impl ToolExecutor<ToolInvocation> for ListMcpResourceTemplatesHandler {
     fn tool_name(&self) -> ToolName {
         ToolName::plain("list_mcp_resource_templates")
     }
 
-    fn spec(&self) -> Option<ToolSpec> {
-        Some(create_list_mcp_resource_templates_tool())
+    fn spec(&self) -> ToolSpec {
+        create_list_mcp_resource_templates_tool()
     }
 
     fn supports_parallel_tool_calls(&self) -> bool {
         true
     }
 
-    fn kind(&self) -> ToolKind {
-        ToolKind::Function
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
+        Box::pin(self.handle_call(invocation))
     }
+}
 
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "MCP resource template listing reads through the session-owned manager guard"
-    )]
-    async fn handle(&self, invocation: ToolInvocation) -> Result<Self::Output, FunctionCallError> {
+impl ListMcpResourceTemplatesHandler {
+    async fn handle_call(
+        &self,
+        invocation: ToolInvocation,
+    ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
         let ToolInvocation {
             session,
-            turn,
+            step_context,
             call_id,
             payload,
             ..
         } = invocation;
+        let turn = std::sync::Arc::clone(&step_context.turn);
+        let mcp = &step_context.mcp;
 
         let arguments = match payload {
             ToolPayload::Function { arguments } => arguments,
@@ -68,27 +63,18 @@ impl ToolHandler for ListMcpResourceTemplatesHandler {
         };
 
         let arguments = parse_arguments(arguments.as_str())?;
-        let args: ListResourceTemplatesArgs = parse_args_with_default(arguments.clone())?;
-        let ListResourceTemplatesArgs { server, cursor } = args;
-        let server = normalize_optional_string(server);
-        let cursor = normalize_optional_string(cursor);
+        let args: ListResourceArgs = parse_args_with_default(arguments.clone())?;
+        let args = args.normalized();
 
         let invocation = McpInvocation {
-            server: server.clone().unwrap_or_else(|| "codex".to_string()),
+            server: args.server.clone().unwrap_or_else(|| "codex".to_string()),
             tool: "list_mcp_resource_templates".to_string(),
             arguments: arguments.clone(),
         };
 
-        emit_tool_call_begin(&session, turn.as_ref(), &call_id, invocation.clone()).await;
-        let start = Instant::now();
-
-        let payload_result: Result<ListResourceTemplatesPayload, FunctionCallError> = async {
-            if let Some(server_name) = server.clone() {
-                let params = cursor.clone().map(|value| PaginatedRequestParams {
-                    meta: None,
-                    cursor: Some(value),
-                });
-                let result = session
+        run_resource_operation(&session, turn.as_ref(), &call_id, invocation, async {
+            if let Some((server_name, params)) = args.target(turn.as_ref())? {
+                let result = mcp
                     .list_resource_templates(&server_name, params)
                     .await
                     .map_err(|err| {
@@ -101,70 +87,16 @@ impl ToolHandler for ListMcpResourceTemplatesHandler {
                     result,
                 ))
             } else {
-                if cursor.is_some() {
-                    return Err(FunctionCallError::RespondToModel(
-                        "cursor can only be used when a server is specified".to_string(),
-                    ));
-                }
-
-                let templates = session
-                    .services
-                    .mcp_connection_manager
-                    .read()
-                    .await
-                    .list_all_resource_templates()
+                let templates = mcp
+                    .list_all_resource_templates(|server_name| {
+                        model_can_access_mcp_server(turn.as_ref(), server_name)
+                    })
                     .await;
                 Ok(ListResourceTemplatesPayload::from_all_servers(templates))
             }
-        }
-        .await;
-
-        match payload_result {
-            Ok(payload) => match serialize_function_output(payload) {
-                Ok(output) => {
-                    let content = function_call_output_content_items_to_text(&output.body)
-                        .unwrap_or_default();
-                    let duration = start.elapsed();
-                    emit_tool_call_end(
-                        &session,
-                        turn.as_ref(),
-                        &call_id,
-                        invocation,
-                        duration,
-                        Ok(call_tool_result_from_content(&content, output.success)),
-                    )
-                    .await;
-                    Ok(output)
-                }
-                Err(err) => {
-                    let duration = start.elapsed();
-                    let message = err.to_string();
-                    emit_tool_call_end(
-                        &session,
-                        turn.as_ref(),
-                        &call_id,
-                        invocation,
-                        duration,
-                        Err(message.clone()),
-                    )
-                    .await;
-                    Err(err)
-                }
-            },
-            Err(err) => {
-                let duration = start.elapsed();
-                let message = err.to_string();
-                emit_tool_call_end(
-                    &session,
-                    turn.as_ref(),
-                    &call_id,
-                    invocation,
-                    duration,
-                    Err(message.clone()),
-                )
-                .await;
-                Err(err)
-            }
-        }
+        })
+        .await
     }
 }
+
+impl CoreToolRuntime for ListMcpResourceTemplatesHandler {}

@@ -1,4 +1,5 @@
 //! Prototype MCP server.
+#![recursion_limit = "256"]
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
 use std::io::ErrorKind;
@@ -6,7 +7,7 @@ use std::io::Result as IoResult;
 use std::sync::Arc;
 
 use codex_arg0::Arg0DispatchPaths;
-use codex_core::config::Config;
+use codex_core::config::ConfigBuilder;
 use codex_core::resolve_installation_id;
 use codex_exec_server::EnvironmentManager;
 use codex_exec_server::ExecServerRuntimePaths;
@@ -28,9 +29,11 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
 
+mod active_turn_registry;
 mod codex_tool_config;
 mod codex_tool_runner;
 mod exec_approval;
+mod extension_event_sink;
 pub(crate) mod message_processor;
 mod outgoing_message;
 mod patch_approval;
@@ -59,7 +62,9 @@ type IncomingMessage = JsonRpcMessage<ClientRequest, Value, ClientNotification>;
 pub async fn run_main(
     arg0_paths: Arg0DispatchPaths,
     cli_config_overrides: CliConfigOverrides,
+    strict_config: bool,
 ) -> IoResult<()> {
+    reject_workload_identity(codex_login::is_workload_identity_selected())?;
     // Parse CLI overrides once and derive the base Config eagerly so later
     // components do not need to work with raw TOML values.
     let cli_kv_overrides = cli_config_overrides.parse_overrides().map_err(|e| {
@@ -68,25 +73,16 @@ pub async fn run_main(
             format!("error parsing -c overrides: {e}"),
         )
     })?;
-    let config = Config::load_with_cli_overrides(cli_kv_overrides)
+    let config = ConfigBuilder::default()
+        .cli_overrides(cli_kv_overrides)
+        .strict_config(strict_config)
+        .build()
         .await
         .map_err(|e| {
             std::io::Error::new(ErrorKind::InvalidData, format!("error loading config: {e}"))
         })?;
+    config.auth_config().validate()?;
     set_default_client_residency_requirement(config.enforce_residency.value());
-    let state_db = codex_core::init_state_db(&config).await;
-    let environment_manager = Arc::new(
-        EnvironmentManager::from_codex_home(
-            config.codex_home.clone(),
-            ExecServerRuntimePaths::from_optional_paths(
-                arg0_paths.codex_self_exe.clone(),
-                arg0_paths.codex_linux_sandbox_exe.clone(),
-            )?,
-        )
-        .await
-        .map_err(std::io::Error::other)?,
-    );
-
     let otel = codex_core::otel_init::build_provider(
         &config,
         env!("CARGO_PKG_VERSION"),
@@ -99,6 +95,21 @@ pub async fn run_main(
             format!("error loading otel config: {e}"),
         )
     })?;
+    codex_core::otel_init::record_process_start(otel.as_ref(), OTEL_SERVICE_NAME);
+    codex_core::otel_init::install_sqlite_telemetry(otel.as_ref(), OTEL_SERVICE_NAME);
+    let state_db = codex_core::init_state_db(&config).await;
+    let environment_manager = Arc::new(
+        EnvironmentManager::from_codex_home(
+            config.codex_home.clone(),
+            Some(ExecServerRuntimePaths::from_optional_paths(
+                arg0_paths.codex_self_exe.clone(),
+                arg0_paths.codex_linux_sandbox_exe.clone(),
+            )?),
+            config.http_client_factory(),
+        )
+        .await
+        .map_err(std::io::Error::other)?,
+    );
 
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)
@@ -151,7 +162,7 @@ pub async fn run_main(
             state_db,
             installation_id,
         )
-        .await;
+        .await?;
         async move {
             while let Some(msg) = incoming_rx.recv().await {
                 match msg {
@@ -196,6 +207,20 @@ pub async fn run_main(
 
     Ok(())
 }
+
+fn reject_workload_identity(workload_identity_selected: bool) -> IoResult<()> {
+    if workload_identity_selected {
+        return Err(std::io::Error::new(
+            ErrorKind::Unsupported,
+            "workload identity is not supported by `codex mcp-server`",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "workload_identity_tests.rs"]
+mod workload_identity_tests;
 
 #[cfg(test)]
 mod tests {

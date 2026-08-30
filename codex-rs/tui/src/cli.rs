@@ -5,12 +5,16 @@ use codex_utils_cli::ApprovalModeCliArg;
 use codex_utils_cli::CliConfigOverrides;
 use codex_utils_cli::SharedCliOptions;
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Clone, Debug)]
 #[command(version)]
 pub struct Cli {
     /// Optional user prompt to start the session.
     #[arg(value_name = "PROMPT", value_hint = clap::ValueHint::Other)]
     pub prompt: Option<String>,
+
+    /// Error out when config.toml contains fields that are not recognized by this version of Codex.
+    #[arg(long = "strict-config", default_value_t = false)]
+    pub strict_config: bool,
 
     // Internal controls set by the top-level `codex resume` subcommand.
     // These are not exposed as user flags on the base `codex` command.
@@ -32,6 +36,10 @@ pub struct Cli {
     /// Internal: include non-interactive sessions in resume listings.
     #[clap(skip)]
     pub resume_include_non_interactive: bool,
+
+    /// Internal: open the daemon-wide agents overview instead of starting a thread.
+    #[clap(skip)]
+    pub agents_overview: bool,
 
     // Internal controls set by the top-level `codex fork` subcommand.
     // These are not exposed as user flags on the base `codex` command.
@@ -63,9 +71,7 @@ pub struct Cli {
 
     /// Disable alternate screen mode
     ///
-    /// Runs the TUI in inline mode, preserving terminal scrollback history. This is useful
-    /// in terminal multiplexers like Zellij that follow the xterm spec strictly and disable
-    /// scrollback in alternate screen buffers.
+    /// Runs the TUI in inline mode, preserving terminal scrollback history.
     #[arg(long = "no-alt-screen", default_value_t = false)]
     pub no_alt_screen: bool,
 
@@ -87,7 +93,7 @@ impl std::ops::DerefMut for Cli {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct TuiSharedCliOptions(SharedCliOptions);
 
 impl TuiSharedCliOptions {
@@ -134,4 +140,5 @@ fn mark_tui_args(cmd: clap::Command) -> clap::Command {
     cmd.mut_arg("dangerously_bypass_approvals_and_sandbox", |arg| {
         arg.conflicts_with("approval_policy")
     })
+    .mut_arg("auto_review", |arg| arg.conflicts_with("approval_policy"))
 }

@@ -2,9 +2,10 @@ use crate::function_tool::FunctionCallError;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
+use crate::tools::context::boxed_tool_output;
 use crate::tools::handlers::plan_spec::create_update_plan_tool;
-use crate::tools::registry::ToolHandler;
-use crate::tools::registry::ToolKind;
+use crate::tools::registry::CoreToolRuntime;
+use crate::tools::registry::ToolExecutor;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseInputItem;
@@ -21,7 +22,7 @@ pub struct PlanToolOutput;
 const PLAN_UPDATED_MESSAGE: &str = "Plan updated";
 
 impl ToolOutput for PlanToolOutput {
-    fn log_preview(&self) -> String {
+    fn log_output(&self) -> String {
         PLAN_UPDATED_MESSAGE.to_string()
     }
 
@@ -44,22 +45,28 @@ impl ToolOutput for PlanToolOutput {
     }
 }
 
-impl ToolHandler for PlanHandler {
-    type Output = PlanToolOutput;
-
+impl ToolExecutor<ToolInvocation> for PlanHandler {
     fn tool_name(&self) -> ToolName {
         ToolName::plain("update_plan")
     }
 
-    fn spec(&self) -> Option<ToolSpec> {
-        Some(create_update_plan_tool())
+    fn spec(&self) -> ToolSpec {
+        create_update_plan_tool()
     }
 
-    fn kind(&self) -> ToolKind {
-        ToolKind::Function
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
+        Box::pin(self.handle_call(invocation))
     }
+}
 
-    async fn handle(&self, invocation: ToolInvocation) -> Result<Self::Output, FunctionCallError> {
+impl PlanHandler {
+    async fn handle_call(
+        &self,
+        invocation: ToolInvocation,
+    ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
         let ToolInvocation {
             session,
             turn,
@@ -77,7 +84,7 @@ impl ToolHandler for PlanHandler {
             }
         };
 
-        if turn.collaboration_mode.mode == ModeKind::Plan {
+        if turn.mode() == ModeKind::Plan {
             return Err(FunctionCallError::RespondToModel(
                 "update_plan is a TODO/checklist tool and is not allowed in Plan mode".to_string(),
             ));
@@ -88,7 +95,13 @@ impl ToolHandler for PlanHandler {
             .send_event(turn.as_ref(), EventMsg::PlanUpdate(args))
             .await;
 
-        Ok(PlanToolOutput)
+        Ok(boxed_tool_output(PlanToolOutput))
+    }
+}
+
+impl CoreToolRuntime for PlanHandler {
+    fn is_builtin_control_tool(&self) -> bool {
+        true
     }
 }
 

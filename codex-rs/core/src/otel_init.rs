@@ -80,7 +80,7 @@ pub fn build_provider(
     let service_name = service_name_override.unwrap_or(originator.value.as_str());
     let runtime_metrics = config.features.enabled(Feature::RuntimeMetrics);
 
-    OtelProvider::from(&OtelSettings {
+    OtelProvider::try_new(&OtelSettings {
         service_name: service_name.to_string(),
         service_version: service_version.to_string(),
         codex_home: config.codex_home.to_path_buf(),
@@ -94,8 +94,17 @@ pub fn build_provider(
     })
 }
 
-/// Filter predicate for exporting only Codex-owned events via OTEL.
-/// Keeps events that originated from codex_otel module
-pub fn codex_export_filter(meta: &tracing::Metadata<'_>) -> bool {
-    meta.target().starts_with("codex_otel")
+pub fn record_process_start(otel: Option<&OtelProvider>, originator: &str) {
+    let Some(metrics) = otel.and_then(OtelProvider::metrics) else {
+        return;
+    };
+    let _ = codex_otel::record_process_start_once(metrics, originator);
+}
+
+pub fn install_sqlite_telemetry(otel: Option<&OtelProvider>, originator: &str) {
+    let Some(metrics) = otel.and_then(OtelProvider::metrics) else {
+        return;
+    };
+    let telemetry = codex_rollout::sqlite_telemetry_recorder(metrics.clone(), originator);
+    let _ = codex_state::install_process_db_telemetry(telemetry);
 }

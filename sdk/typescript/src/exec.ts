@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { statSync } from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
 import { createRequire } from "node:module";
@@ -12,6 +13,8 @@ export type CodexExecArgs = {
   baseUrl?: string;
   apiKey?: string;
   threadId?: string | null;
+  // --thread-source; only applies when creating a new thread
+  threadSource?: string;
   images?: string[];
   // --model
   model?: string;
@@ -54,19 +57,35 @@ const PLATFORM_PACKAGE_BY_TARGET: Record<string, string> = {
 
 const moduleRequire = createRequire(import.meta.url);
 
+type CodexPathResolution = {
+  executablePath: string;
+  pathDirs: string[];
+};
+
 export class CodexExec {
   private executablePath: string;
+  private pathDirs: string[];
   private envOverride?: Record<string, string>;
   private configOverrides?: CodexConfigObject;
+  private rawConfigOverrides?: string[];
 
   constructor(
     executablePath: string | null = null,
     env?: Record<string, string>,
     configOverrides?: CodexConfigObject,
+    rawConfigOverrides?: string[],
   ) {
-    this.executablePath = executablePath || findCodexPath();
+    if (executablePath) {
+      this.executablePath = executablePath;
+      this.pathDirs = [];
+    } else {
+      const resolved = findCodexPath();
+      this.executablePath = resolved.executablePath;
+      this.pathDirs = resolved.pathDirs;
+    }
     this.envOverride = env;
     this.configOverrides = configOverrides;
+    this.rawConfigOverrides = rawConfigOverrides;
   }
 
   async *run(args: CodexExecArgs): AsyncGenerator<string> {
@@ -74,6 +93,12 @@ export class CodexExec {
 
     if (this.configOverrides) {
       for (const override of serializeConfigOverrides(this.configOverrides)) {
+        commandArgs.push("--config", override);
+      }
+    }
+
+    if (this.rawConfigOverrides) {
+      for (const override of this.rawConfigOverrides) {
         commandArgs.push("--config", override);
       }
     }
@@ -87,6 +112,10 @@ export class CodexExec {
 
     if (args.model) {
       commandArgs.push("--model", args.model);
+    }
+
+    if (args.threadSource !== undefined && !args.threadId) {
+      commandArgs.push("--thread-source", args.threadSource);
     }
 
     if (args.sandboxMode) {
@@ -159,6 +188,9 @@ export class CodexExec {
     }
     if (args.apiKey) {
       env.CODEX_API_KEY = args.apiKey;
+    }
+    if (this.pathDirs.length > 0) {
+      prependPathDirs(env, this.pathDirs);
     }
 
     const child = spawn(this.executablePath, commandArgs, {
@@ -314,7 +346,7 @@ function isPlainObject(value: unknown): value is CodexConfigObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function findCodexPath() {
+function findCodexPath(): CodexPathResolution {
   const { platform, arch } = process;
 
   let targetTriple = null;
@@ -381,9 +413,87 @@ function findCodexPath() {
     );
   }
 
-  const archRoot = path.join(vendorRoot, targetTriple);
   const codexBinaryName = process.platform === "win32" ? "codex.exe" : "codex";
-  const binaryPath = path.join(archRoot, "codex", codexBinaryName);
+  const nativePackage = resolveNativePackage(vendorRoot, targetTriple, codexBinaryName);
+  if (!nativePackage) {
+    throw new Error(
+      `Unable to locate Codex CLI binaries for ${targetTriple}. Ensure ${CODEX_NPM_NAME} is installed with optional dependencies.`,
+    );
+  }
 
-  return binaryPath;
+  return nativePackage;
+}
+
+export function resolveNativePackage(
+  vendorRoot: string,
+  targetTriple: string,
+  codexBinaryName: string,
+): CodexPathResolution | null {
+  const packageRoot = path.join(vendorRoot, targetTriple);
+  const packageBinaryPath = path.join(packageRoot, "bin", codexBinaryName);
+  if (isFile(packageBinaryPath) && isFile(path.join(packageRoot, "codex-package.json"))) {
+    return {
+      executablePath: packageBinaryPath,
+      pathDirs: existingDirs(path.join(packageRoot, "codex-path")),
+    };
+  }
+
+  const legacyBinaryPath = path.join(packageRoot, "codex", codexBinaryName);
+  if (isFile(legacyBinaryPath)) {
+    return {
+      executablePath: legacyBinaryPath,
+      pathDirs: existingDirs(path.join(packageRoot, "path")),
+    };
+  }
+
+  return null;
+}
+
+function existingDirs(...dirs: string[]): string[] {
+  return dirs.filter(isDirectory);
+}
+
+export function prependPathDirs(
+  env: Record<string, string>,
+  pathDirs: string[],
+  platform: NodeJS.Platform = process.platform,
+): void {
+  const pathKey = pathEnvKey(env, platform);
+  if (platform === "win32") {
+    for (const key of Object.keys(env)) {
+      if (key.toLowerCase() === "path" && key !== pathKey) {
+        delete env[key];
+      }
+    }
+  }
+
+  const existingEntries = (env[pathKey] ?? "")
+    .split(path.delimiter)
+    .filter((entry) => entry.length > 0 && !pathDirs.includes(entry));
+  env[pathKey] = [...pathDirs, ...existingEntries].join(path.delimiter);
+}
+
+function pathEnvKey(env: Record<string, string>, platform: NodeJS.Platform): string {
+  if (platform !== "win32") {
+    return "PATH";
+  }
+
+  const matchingKeys = Object.keys(env).filter((key) => key.toLowerCase() === "path");
+  return matchingKeys.includes("Path") ? "Path" : (matchingKeys.at(-1) ?? "PATH");
+}
+
+function isFile(filePath: string): boolean {
+  try {
+    return statSync(filePath).isFile();
+  } catch {
+    return false;
+  }
+}
+
+function isDirectory(filePath: string): boolean {
+  try {
+    return statSync(filePath).isDirectory();
+  } catch {
+    return false;
+  }
 }

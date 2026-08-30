@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::sync::Arc;
 
 use crossterm::cursor::SetCursorStyle;
@@ -6,6 +7,7 @@ use ratatui::layout::Rect;
 use ratatui::text::Line;
 use ratatui::text::Span;
 use ratatui::widgets::Paragraph;
+use ratatui::widgets::Widget;
 use ratatui::widgets::WidgetRef;
 
 use crate::render::Insets;
@@ -14,6 +16,13 @@ use crate::render::RectExt as _;
 pub trait Renderable {
     fn render(&self, area: Rect, buf: &mut Buffer);
     fn desired_height(&self, width: u16) -> u16;
+    /// Renders visible rows after `scroll_offset` when direct scrolling is supported.
+    ///
+    /// Implementations returning `false` must leave `buf` unchanged so callers can use their
+    /// existing full-height rendering fallback. Supporting wrappers must forward this method.
+    fn render_scrolled(&self, _area: Rect, _buf: &mut Buffer, _scroll_offset: u16) -> bool {
+        false
+    }
     fn cursor_pos(&self, _area: Rect) -> Option<(u16, u16)> {
         None
     }
@@ -39,6 +48,13 @@ impl<'a> Renderable for RenderableItem<'a> {
         match self {
             RenderableItem::Owned(child) => child.desired_height(width),
             RenderableItem::Borrowed(child) => child.desired_height(width),
+        }
+    }
+
+    fn render_scrolled(&self, area: Rect, buf: &mut Buffer, scroll_offset: u16) -> bool {
+        match self {
+            RenderableItem::Owned(child) => child.render_scrolled(area, buf, scroll_offset),
+            RenderableItem::Borrowed(child) => child.render_scrolled(area, buf, scroll_offset),
         }
     }
 
@@ -108,7 +124,7 @@ impl<'a> Renderable for Span<'a> {
 
 impl<'a> Renderable for Line<'a> {
     fn render(&self, area: Rect, buf: &mut Buffer) {
-        WidgetRef::render_ref(self, area, buf);
+        Widget::render(self, area, buf);
     }
     fn desired_height(&self, _width: u16) -> u16 {
         1
@@ -175,6 +191,9 @@ impl Renderable for ColumnRenderable<'_> {
     fn render(&self, area: Rect, buf: &mut Buffer) {
         let mut y = area.y;
         for child in &self.children {
+            if y >= area.bottom() {
+                break;
+            }
             let child_area = Rect::new(area.x, y, area.width, child.desired_height(area.width))
                 .intersection(area);
             if !child_area.is_empty() {
@@ -247,6 +266,7 @@ impl<'a> ColumnRenderable<'a> {
 pub struct FlexChild<'a> {
     flex: i32,
     child: RenderableItem<'a>,
+    cached_height: Cell<Option<(u16, u16)>>,
 }
 
 pub struct FlexRenderable<'a> {
@@ -266,6 +286,7 @@ impl<'a> FlexRenderable<'a> {
         self.children.push(FlexChild {
             flex,
             child: child.into(),
+            cached_height: Cell::new(None),
         });
     }
 
@@ -276,41 +297,63 @@ impl<'a> FlexRenderable<'a> {
         let mut allocated_rects = Vec::with_capacity(self.children.len());
         let mut child_sizes = vec![0; self.children.len()];
         let mut allocated_size = 0;
-        let mut total_flex = 0;
+        let mut flex_children = Vec::new();
 
         // 1. Allocate space to non-flex children.
         let max_size = area.height;
-        let mut last_flex_child_idx = 0;
-        for (i, FlexChild { flex, child }) in self.children.iter().enumerate() {
-            if *flex > 0 {
-                total_flex += flex;
-                last_flex_child_idx = i;
+        for (i, child) in self.children.iter().enumerate() {
+            let desired_height = if let Some((width, height)) = child.cached_height.get()
+                && width == area.width
+            {
+                height
             } else {
-                child_sizes[i] = child
-                    .desired_height(area.width)
-                    .min(max_size.saturating_sub(allocated_size));
+                let height = child.child.desired_height(area.width);
+                child.cached_height.set(Some((area.width, height)));
+                height
+            };
+            if child.flex > 0 {
+                flex_children.push((i, child.flex as u16, desired_height));
+            } else {
+                child_sizes[i] = desired_height.min(max_size.saturating_sub(allocated_size));
                 allocated_size += child_sizes[i];
             }
         }
         let free_space = max_size.saturating_sub(allocated_size);
-        // 2. Allocate space to flex children, proportional to their flex factor.
-        let mut allocated_flex_space = 0;
-        if total_flex > 0 {
-            let space_per_flex = free_space / total_flex as u16;
-            for (i, FlexChild { flex, child }) in self.children.iter().enumerate() {
-                if *flex > 0 {
-                    // Last flex child gets all the remaining space, to prevent a rounding error
-                    // from not allocating all the space.
-                    let max_child_extent = if i == last_flex_child_idx {
-                        free_space - allocated_flex_space
-                    } else {
-                        space_per_flex * *flex as u16
-                    };
-                    let child_size = child.desired_height(area.width).min(max_child_extent);
-                    child_sizes[i] = child_size;
-                    allocated_flex_space += child_size;
+        // 2. Satisfy flex children that need less than their proportional share so their unused
+        // space can be redistributed instead of leaving blank rows.
+        let mut remaining_space = free_space;
+        while !flex_children.is_empty() {
+            let total_flex = flex_children.iter().map(|(_, flex, _)| *flex).sum::<u16>();
+            let mut satisfied_any = false;
+            flex_children.retain(|(i, flex, desired_height)| {
+                let proportional_share =
+                    (u32::from(remaining_space) * u32::from(*flex) / u32::from(total_flex)) as u16;
+                if *desired_height <= proportional_share {
+                    child_sizes[*i] = *desired_height;
+                    remaining_space = remaining_space.saturating_sub(*desired_height);
+                    satisfied_any = true;
+                    false
+                } else {
+                    true
                 }
+            });
+            if !satisfied_any {
+                break;
             }
+        }
+        // 3. Divide the remaining space proportionally. The final child absorbs rounding slack.
+        let total_flex = flex_children.iter().map(|(_, flex, _)| *flex).sum::<u16>();
+        let mut allocated_flex_space = 0;
+        let last_flex_child_idx = flex_children.last().map(|(i, _, _)| *i);
+        for (i, flex, desired_height) in flex_children {
+            let max_child_extent = if Some(i) == last_flex_child_idx {
+                remaining_space.saturating_sub(allocated_flex_space)
+            } else {
+                (u32::from(remaining_space) * u32::from(flex) / u32::from(total_flex)) as u16
+            };
+            let child_size = desired_height.min(max_child_extent);
+            child_sizes[i] = child_size;
+            allocated_flex_space += child_size;
         }
 
         let mut y = area.y;
@@ -450,6 +493,46 @@ impl<'a> Renderable for InsetRenderable<'a> {
             + self.insets.top
             + self.insets.bottom
     }
+
+    /// Preserve clipped inset padding while forwarding only visible child rows.
+    fn render_scrolled(&self, area: Rect, buf: &mut Buffer, scroll_offset: u16) -> bool {
+        let top_padding = self.insets.top.saturating_sub(scroll_offset);
+        let child_width = area
+            .width
+            .saturating_sub(self.insets.left.saturating_add(self.insets.right));
+        if child_width == 0 || top_padding >= area.height {
+            return true;
+        }
+
+        let child_offset = scroll_offset.saturating_sub(self.insets.top);
+        // The fallback applies bottom padding to its clipped scratch buffer, even mid-scroll.
+        let child_height = self
+            .child
+            .desired_height(child_width)
+            .saturating_sub(child_offset)
+            .min(
+                area.height
+                    .saturating_sub(top_padding)
+                    .saturating_sub(self.insets.bottom),
+            );
+        if child_height == 0 {
+            return true;
+        }
+
+        let child_area = Rect::new(
+            area.x.saturating_add(self.insets.left),
+            area.y.saturating_add(top_padding),
+            child_width,
+            child_height,
+        );
+        if child_offset == 0 {
+            self.child.render(child_area, buf);
+            true
+        } else {
+            self.child.render_scrolled(child_area, buf, child_offset)
+        }
+    }
+
     fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {
         self.child.cursor_pos(area.inset(self.insets))
     }
@@ -482,3 +565,7 @@ where
         RenderableItem::Owned(Box::new(InsetRenderable { child, insets }))
     }
 }
+
+#[cfg(test)]
+#[path = "renderable_tests.rs"]
+mod tests;

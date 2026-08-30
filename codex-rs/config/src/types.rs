@@ -4,20 +4,20 @@
 // definitions that do not contain business logic.
 
 pub use crate::mcp_types::AppToolApproval;
+pub use crate::mcp_types::McpServerAuth;
 pub use crate::mcp_types::McpServerConfig;
 pub use crate::mcp_types::McpServerDisabledReason;
 pub use crate::mcp_types::McpServerEnvVar;
+pub use crate::mcp_types::McpServerOAuthConfig;
 pub use crate::mcp_types::McpServerToolConfig;
 pub use crate::mcp_types::McpServerTransportConfig;
 pub use crate::mcp_types::RawMcpServerConfig;
+pub use crate::shell_environment_policy::ShellEnvironmentPolicyToml;
 pub use codex_protocol::config_types::AltScreenMode;
 pub use codex_protocol::config_types::ApprovalsReviewer;
-use codex_protocol::config_types::EnvironmentVariablePattern;
 pub use codex_protocol::config_types::ModeKind;
 pub use codex_protocol::config_types::Personality;
 pub use codex_protocol::config_types::ServiceTier;
-use codex_protocol::config_types::ShellEnvironmentPolicy;
-use codex_protocol::config_types::ShellEnvironmentPolicyInherit;
 pub use codex_protocol::config_types::WebSearchMode;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use std::collections::BTreeMap;
@@ -30,6 +30,8 @@ use serde::Serialize;
 
 pub use crate::tui_keymap::KeybindingSpec;
 pub use crate::tui_keymap::KeybindingsSpec;
+pub use crate::tui_keymap::MAX_FUNCTION_KEY;
+pub use crate::tui_keymap::TuiAgentsKeymap;
 pub use crate::tui_keymap::TuiApprovalKeymap;
 pub use crate::tui_keymap::TuiChatKeymap;
 pub use crate::tui_keymap::TuiComposerKeymap;
@@ -40,6 +42,7 @@ pub use crate::tui_keymap::TuiListKeymap;
 pub use crate::tui_keymap::TuiPagerKeymap;
 pub use crate::tui_keymap::TuiVimNormalKeymap;
 pub use crate::tui_keymap::TuiVimOperatorKeymap;
+pub use crate::tui_keymap::TuiVimSearchKeymap;
 
 pub const DEFAULT_OTEL_ENVIRONMENT: &str = "dev";
 pub const DEFAULT_MEMORIES_MAX_ROLLOUTS_PER_STARTUP: usize = 2;
@@ -81,6 +84,25 @@ impl fmt::Display for SessionPickerViewMode {
     }
 }
 
+/// Working directory to use when resuming or forking a session.
+#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum ResumeCwdMode {
+    /// Use the directory where Codex was launched.
+    Current,
+    /// Use the latest working directory recorded in the selected session.
+    Session,
+}
+
+impl ResumeCwdMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::Session => "session",
+        }
+    }
+}
+
 /// Determine where Codex should store CLI auth credentials.
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
@@ -100,7 +122,9 @@ pub enum AuthCredentialsStoreMode {
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum OAuthCredentialsStoreMode {
-    /// `Keyring` when available; otherwise, `File`.
+    /// Prefer `Keyring` and use `File` when keyring storage is unavailable.
+    /// Once an MCP client loads credentials from one store, that client keeps the resolved store
+    /// for its lifetime so refreshes cannot switch to a possibly stale credential source.
     /// Credentials stored in the keyring will only be readable by Codex unless the user explicitly grants access via OS-level keyring access.
     #[default]
     Auto,
@@ -109,6 +133,26 @@ pub enum OAuthCredentialsStoreMode {
     File,
     /// Keyring when available, otherwise fail.
     Keyring,
+}
+
+/// Determine how auth credentials should use keyring-backed storage.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthKeyringBackendKind {
+    /// Store the serialized auth payload directly in the OS keyring.
+    Direct,
+    /// Store auth payloads in the local encrypted secrets file, with the file key in the OS keyring.
+    Secrets,
+}
+
+impl Default for AuthKeyringBackendKind {
+    fn default() -> Self {
+        if cfg!(windows) {
+            Self::Secrets
+        } else {
+            Self::Direct
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema)]
@@ -144,18 +188,6 @@ pub enum UriBasedFileOpener {
     /// Option to disable the URI-based file opener.
     #[serde(rename = "none")]
     None,
-}
-
-impl UriBasedFileOpener {
-    pub fn get_scheme(&self) -> Option<&str> {
-        match self {
-            UriBasedFileOpener::VsCode => Some("vscode"),
-            UriBasedFileOpener::VsCodeInsiders => Some("vscode-insiders"),
-            UriBasedFileOpener::Windsurf => Some("windsurf"),
-            UriBasedFileOpener::Cursor => Some("cursor"),
-            UriBasedFileOpener::None => None,
-        }
-    }
 }
 
 /// Settings that govern if and what will be written to `~/.codex/history.jsonl`.
@@ -265,6 +297,8 @@ pub struct MemoriesToml {
     pub generate_memories: Option<bool>,
     /// When `false`, skip injecting memory usage instructions into developer prompts.
     pub use_memories: Option<bool>,
+    /// When `true`, expose dedicated memory tools through the extension tool surface.
+    pub dedicated_tools: Option<bool>,
     /// Maximum number of recent raw memories retained for global consolidation.
     #[schemars(range(min = 1, max = 4096))]
     pub max_raw_memories_for_consolidation: Option<usize>,
@@ -292,6 +326,7 @@ pub struct MemoriesConfig {
     pub disable_on_external_context: bool,
     pub generate_memories: bool,
     pub use_memories: bool,
+    pub dedicated_tools: bool,
     pub max_raw_memories_for_consolidation: usize,
     pub max_unused_days: i64,
     pub max_rollout_age_days: i64,
@@ -308,6 +343,7 @@ impl Default for MemoriesConfig {
             disable_on_external_context: false,
             generate_memories: true,
             use_memories: true,
+            dedicated_tools: false,
             max_raw_memories_for_consolidation: DEFAULT_MEMORIES_MAX_RAW_MEMORIES_FOR_CONSOLIDATION,
             max_unused_days: DEFAULT_MEMORIES_MAX_UNUSED_DAYS,
             max_rollout_age_days: DEFAULT_MEMORIES_MAX_ROLLOUT_AGE_DAYS,
@@ -329,6 +365,7 @@ impl From<MemoriesToml> for MemoriesConfig {
                 .unwrap_or(defaults.disable_on_external_context),
             generate_memories: toml.generate_memories.unwrap_or(defaults.generate_memories),
             use_memories: toml.use_memories.unwrap_or(defaults.use_memories),
+            dedicated_tools: toml.dedicated_tools.unwrap_or(defaults.dedicated_tools),
             max_raw_memories_for_consolidation: toml
                 .max_raw_memories_for_consolidation
                 .unwrap_or(defaults.max_raw_memories_for_consolidation)
@@ -373,6 +410,10 @@ pub struct AppsDefaultConfig {
     #[serde(default = "default_enabled")]
     pub enabled: bool,
 
+    /// Reviewer for approval prompts unless overridden by per-app settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approvals_reviewer: Option<ApprovalsReviewer>,
+
     /// Whether tools with `destructive_hint = true` are allowed by default.
     #[serde(
         default = "default_enabled",
@@ -386,6 +427,10 @@ pub struct AppsDefaultConfig {
         skip_serializing_if = "std::clone::Clone::clone"
     )]
     pub open_world_enabled: bool,
+
+    /// Approval mode for tools unless overridden by per-app or per-tool settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_tools_approval_mode: Option<AppToolApproval>,
 }
 
 /// Per-tool settings for a single app tool.
@@ -417,6 +462,10 @@ pub struct AppConfig {
     /// When `false`, Codex does not surface this app.
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+
+    /// Reviewer for approval prompts from this app, overriding the thread default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approvals_reviewer: Option<ApprovalsReviewer>,
 
     /// Whether tools with `destructive_hint = true` are allowed for this app.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -500,6 +549,9 @@ pub enum OtelExporterKind {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct OtelConfigToml {
+    /// Byte limit for tool-result log output; independent of model-visible output.
+    #[serde(default)]
+    pub tool_result: codex_protocol::config_types::ToolResultLogConfig,
     /// Log user prompt in traces
     pub log_user_prompt: Option<bool>,
 
@@ -525,6 +577,7 @@ pub struct OtelConfigToml {
 /// Effective OTEL settings after defaults are applied.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OtelConfig {
+    pub tool_result: codex_protocol::config_types::ToolResultLogConfig,
     pub log_user_prompt: bool,
     pub environment: String,
     pub exporter: OtelExporterKind,
@@ -537,6 +590,7 @@ pub struct OtelConfig {
 impl Default for OtelConfig {
     fn default() -> Self {
         OtelConfig {
+            tool_result: Default::default(),
             log_user_prompt: false,
             environment: DEFAULT_OTEL_ENVIRONMENT.to_owned(),
             exporter: OtelExporterKind::None,
@@ -599,6 +653,16 @@ impl fmt::Display for NotificationCondition {
     }
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum TuiPetAnchor {
+    /// Anchor the pet to the bottom of the current TUI composer viewport.
+    #[default]
+    Composer,
+    /// Anchor the pet to the physical bottom of the terminal screen.
+    ScreenBottom,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct TuiNotificationSettings {
@@ -658,12 +722,9 @@ pub struct Tui {
 
     /// Controls whether the TUI uses the terminal's alternate screen buffer.
     ///
-    /// - `auto` (default): Disable alternate screen in Zellij, enable elsewhere.
-    /// - `always`: Always use alternate screen (original behavior).
+    /// - `auto` (default): Use alternate screen.
+    /// - `always`: Always use alternate screen.
     /// - `never`: Never use alternate screen (inline mode only, preserves scrollback).
-    ///
-    /// Using alternate screen provides a cleaner fullscreen experience but prevents
-    /// scrollback in terminal multiplexers like Zellij that follow the xterm spec.
     #[serde(default)]
     pub alternate_screen: AltScreenMode,
 
@@ -695,9 +756,26 @@ pub struct Tui {
     #[serde(default)]
     pub theme: Option<String>,
 
+    /// Pet id to preselect in the terminal pet picker.
+    ///
+    /// Custom pet ids resolve against CODEX_HOME/pets/<pet-id>/pet.json.
+    #[serde(default)]
+    pub pet: Option<String>,
+
+    /// Where the terminal pet should anchor vertically.
+    ///
+    /// Defaults to `composer`, which follows the current TUI composer viewport.
+    #[serde(default)]
+    pub pet_anchor: TuiPetAnchor,
+
     /// Preferred layout for resume/fork session picker results.
     #[serde(default)]
     pub session_picker_view: Option<SessionPickerViewMode>,
+
+    /// Working directory to use when resuming or forking a session.
+    /// When unset, prompt if the current and session directories differ.
+    #[serde(default)]
+    pub resume_cwd: Option<ResumeCwdMode>,
 
     /// Keybinding overrides for the TUI.
     ///
@@ -802,7 +880,7 @@ pub struct PluginMcpServerConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disabled_tools: Option<Vec<String>>,
 
-    /// Per-tool approval settings keyed by tool name.
+    /// Per-tool policy settings keyed by tool name.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub tools: HashMap<String, McpServerToolConfig>,
 }
@@ -860,68 +938,6 @@ pub struct SandboxWorkspaceWrite {
     pub exclude_tmpdir_env_var: bool,
     #[serde(default)]
     pub exclude_slash_tmp: bool,
-}
-
-impl From<SandboxWorkspaceWrite> for codex_app_server_protocol::SandboxSettings {
-    fn from(sandbox_workspace_write: SandboxWorkspaceWrite) -> Self {
-        Self {
-            writable_roots: sandbox_workspace_write.writable_roots,
-            network_access: Some(sandbox_workspace_write.network_access),
-            exclude_tmpdir_env_var: Some(sandbox_workspace_write.exclude_tmpdir_env_var),
-            exclude_slash_tmp: Some(sandbox_workspace_write.exclude_slash_tmp),
-        }
-    }
-}
-
-/// Policy for building the `env` when spawning a process via either the
-/// `shell` or `local_shell` tool.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
-#[schemars(deny_unknown_fields)]
-pub struct ShellEnvironmentPolicyToml {
-    pub inherit: Option<ShellEnvironmentPolicyInherit>,
-
-    pub ignore_default_excludes: Option<bool>,
-
-    /// List of regular expressions.
-    pub exclude: Option<Vec<String>>,
-
-    pub r#set: Option<HashMap<String, String>>,
-
-    /// List of regular expressions.
-    pub include_only: Option<Vec<String>>,
-
-    pub experimental_use_profile: Option<bool>,
-}
-
-impl From<ShellEnvironmentPolicyToml> for ShellEnvironmentPolicy {
-    fn from(toml: ShellEnvironmentPolicyToml) -> Self {
-        // Default to inheriting the full environment when not specified.
-        let inherit = toml.inherit.unwrap_or(ShellEnvironmentPolicyInherit::All);
-        let ignore_default_excludes = toml.ignore_default_excludes.unwrap_or(true);
-        let exclude = toml
-            .exclude
-            .unwrap_or_default()
-            .into_iter()
-            .map(|s| EnvironmentVariablePattern::new_case_insensitive(&s))
-            .collect();
-        let r#set = toml.r#set.unwrap_or_default();
-        let include_only = toml
-            .include_only
-            .unwrap_or_default()
-            .into_iter()
-            .map(|s| EnvironmentVariablePattern::new_case_insensitive(&s))
-            .collect();
-        let use_profile = toml.experimental_use_profile.unwrap_or(false);
-
-        Self {
-            inherit,
-            ignore_default_excludes,
-            exclude,
-            r#set,
-            include_only,
-            use_profile,
-        }
-    }
 }
 
 #[cfg(test)]

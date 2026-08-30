@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use crate::diff_model::FileChange;
 use codex_app_server_protocol::AdditionalPermissionProfile;
 use codex_app_server_protocol::CommandExecutionApprovalDecision;
+use codex_app_server_protocol::CommandExecutionApprovalKind;
 use codex_app_server_protocol::ExecPolicyAmendment;
 use codex_app_server_protocol::NetworkApprovalContext;
 use codex_app_server_protocol::NetworkPolicyAmendment;
@@ -21,11 +22,15 @@ use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ExecApprovalRequestEvent {
+    #[serde(default)]
+    pub(crate) kind: CommandExecutionApprovalKind,
     pub(crate) call_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) approval_id: Option<String>,
     #[serde(default)]
     pub(crate) turn_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) environment_id: Option<String>,
     pub(crate) command: Vec<String>,
     pub(crate) cwd: AbsolutePathBuf,
     pub(crate) reason: Option<String>,

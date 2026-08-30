@@ -2,14 +2,15 @@ use std::path::PathBuf;
 
 use codex_utils_absolute_path::AbsolutePathBuf;
 
-use crate::command_safety::try_parse_powershell_ast_commands;
+use crate::command_safety::try_parse_powershell_commands;
 use crate::shell_detect::ShellType;
 use crate::shell_detect::detect_shell_type;
 
 const POWERSHELL_FLAGS: &[&str] = &["-nologo", "-noprofile", "-command", "-c"];
 
-/// Prefixed command for powershell shell calls to force UTF-8 console output.
-pub const UTF8_OUTPUT_PREFIX: &str = "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;\n";
+/// Prefixed command for powershell shell calls to request UTF-8 console output.
+pub const UTF8_OUTPUT_PREFIX: &str =
+    "try { [Console]::OutputEncoding=[System.Text.Encoding]::UTF8 } catch {}\n";
 
 pub fn prefix_powershell_script_with_utf8(command: &[String]) -> Vec<String> {
     let Some((_, script)) = extract_powershell_command(command) else {
@@ -46,7 +47,7 @@ pub fn extract_powershell_command(command: &[String]) -> Option<(&str, &str)> {
 
     let shell = &command[0];
     if !matches!(
-        detect_shell_type(&PathBuf::from(shell)),
+        detect_shell_type(PathBuf::from(shell)),
         Some(ShellType::PowerShell)
     ) {
         return None;
@@ -71,14 +72,21 @@ pub fn extract_powershell_command(command: &[String]) -> Option<(&str, &str)> {
 
 /// Parse the script body from a top-level PowerShell wrapper into argv-like commands.
 ///
-/// This is intentionally narrower than the Windows safe-command parser: it only unwraps the
-/// `-Command`/`-c` body from a PowerShell invocation we already recognize, then delegates the
-/// script itself to the PowerShell AST parser.
+/// This only unwraps the `-Command`/`-c` body from a PowerShell invocation we
+/// already recognize, then lowers the script in-process.
 pub fn parse_powershell_command_into_plain_commands(
     command: &[String],
 ) -> Option<Vec<Vec<String>>> {
-    let (executable, script) = extract_powershell_command(command)?;
-    try_parse_powershell_ast_commands(executable, script)
+    let (_, script) = extract_powershell_command(command)?;
+    try_parse_powershell_commands(script)
+}
+
+/// Parse literal PowerShell commands without starting a PowerShell executable.
+///
+/// Unknown or dynamic syntax stays opaque so unfamiliar executables can be
+/// evaluated without running them before approval.
+pub fn parse_powershell_script_into_plain_commands(script: &str) -> Option<Vec<Vec<String>>> {
+    try_parse_powershell_commands(script)
 }
 
 /// This function attempts to find a powershell.exe executable on the system.
@@ -151,9 +159,12 @@ fn is_powershellish_executable_available(powershell_or_pwsh_exe: &std::path::Pat
 
 #[cfg(test)]
 mod tests {
+    use super::UTF8_OUTPUT_PREFIX;
     use super::extract_powershell_command;
     #[cfg(windows)]
     use super::parse_powershell_command_into_plain_commands;
+    use super::parse_powershell_script_into_plain_commands;
+    use super::prefix_powershell_script_with_utf8;
 
     #[test]
     fn extracts_basic_powershell_command() {
@@ -200,6 +211,48 @@ mod tests {
         ];
         let (_shell, script) = extract_powershell_command(&cmd).expect("extract");
         assert_eq!(script, "Get-ChildItem | Select-String foo");
+    }
+
+    #[test]
+    fn parses_powershell_command_chains_and_preserves_windows_paths() {
+        assert_eq!(
+            parse_powershell_script_into_plain_commands(r"echo safe && Remove-Item C:\important"),
+            Some(vec![
+                vec!["echo".to_string(), "safe".to_string()],
+                vec!["Remove-Item".to_string(), r"C:\important".to_string()],
+            ]),
+        );
+    }
+
+    #[test]
+    fn prefixes_powershell_command_with_best_effort_utf8() {
+        let cmd = vec![
+            "powershell".to_string(),
+            "-Command".to_string(),
+            "Write-Host hi".to_string(),
+        ];
+
+        let prefixed = prefix_powershell_script_with_utf8(&cmd);
+
+        assert_eq!(
+            prefixed,
+            vec![
+                "powershell".to_string(),
+                "-Command".to_string(),
+                format!("{UTF8_OUTPUT_PREFIX}Write-Host hi"),
+            ]
+        );
+    }
+
+    #[test]
+    fn does_not_duplicate_utf8_prefix() {
+        let cmd = vec![
+            "powershell".to_string(),
+            "-Command".to_string(),
+            format!("{UTF8_OUTPUT_PREFIX}Write-Host hi"),
+        ];
+
+        assert_eq!(prefix_powershell_script_with_utf8(&cmd), cmd);
     }
 
     #[cfg(windows)]

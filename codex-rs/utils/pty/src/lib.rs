@@ -4,8 +4,12 @@ pub mod process_group;
 pub mod pty;
 #[cfg(test)]
 mod tests;
+#[cfg(unix)]
+mod unix_io;
 #[cfg(windows)]
 mod win;
+#[cfg(windows)]
+mod windows_input;
 
 pub const DEFAULT_OUTPUT_BYTES_CAP: usize = 1024 * 1024;
 
@@ -17,6 +21,8 @@ pub use pipe::spawn_process_no_stdin as spawn_pipe_process_no_stdin;
 pub use process::ProcessDriver;
 /// Handle for interacting with a spawned process (PTY or pipe).
 pub use process::ProcessHandle;
+/// Process signal supported by spawned-process handles.
+pub use process::ProcessSignal;
 /// Bundle of process handles plus split output and exit receivers returned by spawn helpers.
 pub use process::SpawnedProcess;
 /// Terminal size in character cells used for PTY spawn and resize operations.
@@ -34,6 +40,10 @@ pub use pty::conpty_supported;
 /// Spawn a process attached to a PTY for interactive use.
 pub use pty::spawn_process as spawn_pty_process;
 #[cfg(windows)]
+pub use win::JobObject;
+#[cfg(windows)]
 pub use win::PsuedoCon;
 #[cfg(windows)]
 pub use win::conpty::RawConPty;
+#[cfg(windows)]
+pub use windows_input::WindowsTtyInputNormalizer;

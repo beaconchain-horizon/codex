@@ -1,5 +1,5 @@
 use super::*;
-use codex_app_server_protocol::AppInfo;
+use codex_connectors::AppInfo;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 
@@ -26,6 +26,8 @@ fn filter_request_plugin_install_discoverable_tools_for_codex_tui_omits_plugins(
             description: Some("Plan events and schedules.".to_string()),
             logo_url: None,
             logo_url_dark: None,
+            icon_assets: None,
+            icon_dark_assets: None,
             distribution_channel: None,
             branding: None,
             app_metadata: None,
@@ -37,6 +39,7 @@ fn filter_request_plugin_install_discoverable_tools_for_codex_tui_omits_plugins(
         })),
         DiscoverableTool::Plugin(Box::new(DiscoverablePluginInfo {
             id: "slack@openai-curated".to_string(),
+            remote_plugin_id: None,
             name: "Slack".to_string(),
             description: Some("Search Slack messages".to_string()),
             has_skills: true,
@@ -56,6 +59,8 @@ fn filter_request_plugin_install_discoverable_tools_for_codex_tui_omits_plugins(
             description: Some("Plan events and schedules.".to_string()),
             logo_url: None,
             logo_url_dark: None,
+            icon_assets: None,
+            icon_dark_assets: None,
             distribution_channel: None,
             branding: None,
             app_metadata: None,

@@ -4,7 +4,7 @@ import {
   assistantMessage,
   responseCompleted,
   responseStarted,
-  shell_call as shellCall,
+  exec_command_call as execCommandCall,
   sse,
   SseResponseBody,
   startResponsesTestProxy,
@@ -13,7 +13,7 @@ import { createMockClient } from "./testCodex";
 
 function* infiniteShellCall(): Generator<SseResponseBody> {
   while (true) {
-    yield sse(responseStarted(), shellCall(), responseCompleted());
+    yield sse(responseStarted(), execCommandCall(), responseCompleted());
   }
 }
 
@@ -127,7 +127,7 @@ describe("AbortSignal support", () => {
             void event; // Consume the event
             eventCount++;
             // Abort after first event
-            if (eventCount === 5) {
+            if (eventCount === 1) {
               controller.abort("Aborted during iteration");
             }
             // Continue iterating - should eventually throw

@@ -1,8 +1,7 @@
-#![allow(clippy::expect_used)]
-
 use super::compact::COMPACT_WARNING_MESSAGE;
 use anyhow::Result;
 use codex_core::CodexThread;
+use codex_core::TurnInputRequest;
 use codex_core::compact::SUMMARIZATION_PROMPT;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
@@ -73,7 +72,6 @@ async fn window_id_advances_after_compact_persists_on_resume_and_resets_on_fork(
             resumed.config.clone(),
             rollout_path,
             /*thread_source*/ None,
-            /*persist_extended_history*/ false,
             /*parent_trace*/ None,
         )
         .await?;
@@ -99,20 +97,55 @@ async fn window_id_advances_after_compact_persists_on_resume_and_resets_on_fork(
     assert_ne!(after_fork_thread_id, initial_thread_id);
     assert_eq!(after_fork_generation, 0);
 
+    let metadata = requests
+        .iter()
+        .map(|request| {
+            let metadata = request
+                .header("x-codex-turn-metadata")
+                .expect("turn metadata header");
+            serde_json::from_str::<serde_json::Value>(&metadata).expect("valid turn metadata")
+        })
+        .collect::<Vec<_>>();
+    for (request, metadata) in requests.iter().zip(&metadata) {
+        assert_eq!(
+            metadata["window_id"].as_str(),
+            request.header("x-codex-window-id").as_deref()
+        );
+        assert!(
+            metadata["context_window_id"]
+                .as_str()
+                .is_some_and(|window_id| uuid::Uuid::parse_str(window_id).is_ok())
+        );
+    }
+    assert_eq!(
+        metadata[0]["context_window_id"],
+        metadata[1]["context_window_id"]
+    );
+    assert_ne!(
+        metadata[1]["context_window_id"],
+        metadata[2]["context_window_id"]
+    );
+    assert_eq!(
+        metadata[2]["context_window_id"],
+        metadata[3]["context_window_id"]
+    );
+    assert_eq!(
+        metadata
+            .iter()
+            .map(|metadata| metadata["window_number"].as_u64())
+            .collect::<Vec<_>>(),
+        vec![Some(0), Some(0), Some(1), Some(1), Some(0)]
+    );
+
     Ok(())
 }
 
 async fn submit_user_turn(codex: &Arc<CodexThread>, text: &str) -> Result<()> {
     codex
-        .submit(Op::UserInput {
-            environments: None,
-            items: vec![UserInput::Text {
-                text: text.to_string(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: text.to_string(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
     Ok(())
@@ -141,9 +174,9 @@ fn window_id_parts(request: &ResponsesRequest) -> (String, u64) {
         .expect("missing x-codex-window-id header");
     let (thread_id, generation) = window_id
         .rsplit_once(':')
-        .unwrap_or_else(|| panic!("invalid window id header: {window_id}"));
+        .expect("window id header should contain a generation");
     let generation = generation
         .parse::<u64>()
-        .unwrap_or_else(|err| panic!("invalid window generation in {window_id}: {err}"));
+        .expect("window generation should be a valid integer");
     (thread_id.to_string(), generation)
 }

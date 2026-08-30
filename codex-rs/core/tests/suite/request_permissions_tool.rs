@@ -1,10 +1,14 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used)]
 #![cfg(target_os = "macos")]
 
 use anyhow::Result;
+use codex_core::TurnInputRequest;
 use codex_core::config::Constrained;
 use codex_features::Feature;
 use codex_protocol::config_types::ApprovalsReviewer;
+use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::config_types::ModeKind;
+use codex_protocol::config_types::Settings;
 use codex_protocol::models::FileSystemPermissions;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::NetworkSandboxPolicy;
@@ -12,6 +16,7 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ReviewDecision;
+use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::request_permissions::PermissionGrantScope;
 use codex_protocol::request_permissions::RequestPermissionProfile;
 use codex_protocol::request_permissions::RequestPermissionsResponse;
@@ -28,6 +33,7 @@ use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
 use core_test_support::skip_if_sandbox;
 use core_test_support::test_codex::TestCodex;
+use core_test_support::test_codex::local_selections;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
@@ -37,6 +43,7 @@ use serde_json::Value;
 use serde_json::json;
 use std::fs;
 use std::path::Path;
+use test_case::test_case;
 
 fn absolute_path(path: &Path) -> AbsolutePathBuf {
     AbsolutePathBuf::try_from(path).expect("absolute path")
@@ -142,25 +149,28 @@ async fn submit_turn(
     let (sandbox_policy, permission_profile) =
         turn_permission_fields(permission_profile, test.config.cwd.as_path());
     test.codex
-        .submit(Op::UserTurn {
-            environments: None,
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: prompt.into(),
                 text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            cwd: test.cwd.path().to_path_buf(),
-            approval_policy,
-            approvals_reviewer,
-            sandbox_policy,
-            permission_profile,
-            model: session_model,
-            effort: None,
-            summary: None,
-            service_tier: None,
-            collaboration_mode: None,
-            personality: None,
-        })
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
+                environments: Some(local_selections(test.config.cwd.clone())),
+                approval_policy: Some(approval_policy),
+                approvals_reviewer,
+                sandbox_policy: Some(sandbox_policy),
+                permission_profile,
+                collaboration_mode: Some(CollaborationMode {
+                    mode: ModeKind::Default,
+                    settings: Settings {
+                        model: session_model,
+                        reasoning_effort: None,
+                        developer_instructions: None,
+                    },
+                }),
+                ..Default::default()
+            }),
+        )
         .await?;
     Ok(())
 }
@@ -308,7 +318,7 @@ async fn approved_folder_write_request_permissions_unblocks_later_exec_without_s
     let exec_output = responses
         .function_call_output_text("exec-call")
         .map(|output| json!({ "output": output }))
-        .unwrap_or_else(|| panic!("expected exec-call output"));
+        .expect("expected exec-call output");
     let (exit_code, stdout) = parse_result(&exec_output);
     assert!(exit_code.is_none() || exit_code == Some(0));
     assert!(stdout.contains("folder-grant-ok"));
@@ -321,16 +331,17 @@ async fn approved_folder_write_request_permissions_unblocks_later_exec_without_s
     Ok(())
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[test_case(false ; "without_strict_auto_review")]
+#[test_case(true ; "with_strict_auto_review")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(target_os = "macos")]
-async fn approved_folder_write_request_permissions_unblocks_later_apply_patch() -> Result<()> {
+async fn approved_folder_write_request_permissions_unblocks_later_apply_patch(
+    strict_auto_review: bool,
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
     skip_if_sandbox!(Ok(()));
 
-    apply_patch_after_request_permissions(/*strict_auto_review*/ false).await?;
-    apply_patch_after_request_permissions(/*strict_auto_review*/ true).await?;
-
-    Ok(())
+    apply_patch_after_request_permissions(strict_auto_review).await
 }
 
 async fn apply_patch_after_request_permissions(strict_auto_review: bool) -> Result<()> {
@@ -340,7 +351,6 @@ async fn apply_patch_after_request_permissions(strict_auto_review: bool) -> Resu
     let permission_profile_for_config = permission_profile.clone();
 
     let mut builder = test_codex().with_config(move |config| {
-        config.include_apply_patch_tool = true;
         config.permissions.approval_policy = Constrained::allow_any(approval_policy);
         config
             .permissions
@@ -492,7 +502,7 @@ async fn apply_patch_after_request_permissions(strict_auto_review: bool) -> Resu
                 })
         })
         .map(|output| json!({ "output": output }))
-        .unwrap_or_else(|| panic!("expected apply-patch-call output"));
+        .expect("expected apply-patch-call output");
     let (exit_code, stdout) = parse_result(&patch_output);
     assert!(exit_code.is_none() || exit_code == Some(0));
     assert!(
@@ -503,6 +513,8 @@ async fn apply_patch_after_request_permissions(strict_auto_review: bool) -> Resu
         fs::read_to_string(&requested_file)?,
         format!("{patch_content}\n")
     );
+
+    test.codex.shutdown_and_wait().await?;
 
     Ok(())
 }

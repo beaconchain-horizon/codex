@@ -9,6 +9,7 @@ use windows_sys::Win32::Foundation::HLOCAL;
 use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 use windows_sys::Win32::Foundation::LocalFree;
 use windows_sys::Win32::Security::ACCESS_ALLOWED_ACE;
+use windows_sys::Win32::Security::ACCESS_DENIED_ACE;
 use windows_sys::Win32::Security::ACE_HEADER;
 use windows_sys::Win32::Security::ACL;
 use windows_sys::Win32::Security::ACL_SIZE_INFORMATION;
@@ -48,8 +49,20 @@ use windows_sys::Win32::Storage::FileSystem::OPEN_EXISTING;
 use windows_sys::Win32::Storage::FileSystem::READ_CONTROL;
 const SE_KERNEL_OBJECT: u32 = 6;
 const INHERIT_ONLY_ACE: u8 = 0x08;
+const INHERITED_ACE: u8 = 0x10;
+const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+const ACCESS_DENIED_ACE_TYPE: u8 = 1;
+const GENERIC_READ_MASK: u32 = 0x8000_0000;
 const GENERIC_WRITE_MASK: u32 = 0x4000_0000;
 const DENY_ACCESS: i32 = 3;
+
+fn acl_api_result(path: &Path, operation: &str, code: u32) -> Result<()> {
+    if code == ERROR_SUCCESS {
+        Ok(())
+    } else {
+        Err(anyhow!("{operation} failed for {}: {code}", path.display()))
+    }
+}
 
 /// Fetch DACL via handle-based query; caller must LocalFree the returned SD.
 ///
@@ -100,6 +113,28 @@ pub unsafe fn dacl_mask_allows(
     desired_mask: u32,
     require_all_bits: bool,
 ) -> bool {
+    dacl_mask_allows_with_scope(
+        p_dacl,
+        psids,
+        desired_mask,
+        require_all_bits,
+        AceScope::Effective,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum AceScope {
+    Effective,
+    Explicit,
+}
+
+unsafe fn dacl_mask_allows_with_scope(
+    p_dacl: *mut ACL,
+    psids: &[*mut c_void],
+    desired_mask: u32,
+    require_all_bits: bool,
+    scope: AceScope,
+) -> bool {
     if p_dacl.is_null() {
         return false;
     }
@@ -125,10 +160,15 @@ pub unsafe fn dacl_mask_allows(
             continue;
         }
         let hdr = &*(p_ace as *const ACE_HEADER);
-        if hdr.AceType != 0 {
+        if hdr.AceType != ACCESS_ALLOWED_ACE_TYPE {
             continue; // not ACCESS_ALLOWED
         }
         if (hdr.AceFlags & INHERIT_ONLY_ACE) != 0 {
+            continue;
+        }
+        // SET_ACCESS cannot replace an ACE inherited from an ancestor, so it cannot make
+        // an explicit-only repair converge when that inherited ACE contains stale rights.
+        if matches!(scope, AceScope::Explicit) && (hdr.AceFlags & INHERITED_ACE) != 0 {
             continue;
         }
         let base = p_ace as usize;
@@ -163,9 +203,25 @@ pub fn path_mask_allows(
     desired_mask: u32,
     require_all_bits: bool,
 ) -> Result<bool> {
+    path_mask_allows_with_scope(
+        path,
+        psids,
+        desired_mask,
+        require_all_bits,
+        AceScope::Effective,
+    )
+}
+
+fn path_mask_allows_with_scope(
+    path: &Path,
+    psids: &[*mut c_void],
+    desired_mask: u32,
+    require_all_bits: bool,
+    scope: AceScope,
+) -> Result<bool> {
     unsafe {
         let (p_dacl, sd) = fetch_dacl_handle(path)?;
-        let has = dacl_mask_allows(p_dacl, psids, desired_mask, require_all_bits);
+        let has = dacl_mask_allows_with_scope(p_dacl, psids, desired_mask, require_all_bits, scope);
         if !sd.is_null() {
             LocalFree(sd as HLOCAL);
         }
@@ -194,7 +250,7 @@ pub unsafe fn dacl_has_write_allow_for_sid(p_dacl: *mut ACL, psid: *mut c_void) 
             continue;
         }
         let hdr = &*(p_ace as *const ACE_HEADER);
-        if hdr.AceType != 0 {
+        if hdr.AceType != ACCESS_ALLOWED_ACE_TYPE {
             continue; // ACCESS_ALLOWED_ACE_TYPE
         }
         // Ignore ACEs that are inherit-only (do not apply to the current object)
@@ -242,13 +298,13 @@ pub unsafe fn dacl_has_write_deny_for_sid(p_dacl: *mut ACL, psid: *mut c_void) -
             continue;
         }
         let hdr = &*(p_ace as *const ACE_HEADER);
-        if hdr.AceType != 1 {
+        if hdr.AceType != ACCESS_DENIED_ACE_TYPE {
             continue; // ACCESS_DENIED_ACE_TYPE
         }
         if (hdr.AceFlags & INHERIT_ONLY_ACE) != 0 {
             continue;
         }
-        let ace = &*(p_ace as *const ACCESS_ALLOWED_ACE);
+        let ace = &*(p_ace as *const ACCESS_DENIED_ACE);
         let base = p_ace as usize;
         let sid_ptr =
             (base + std::mem::size_of::<ACE_HEADER>() + std::mem::size_of::<u32>()) as *mut c_void;
@@ -259,19 +315,91 @@ pub unsafe fn dacl_has_write_deny_for_sid(p_dacl: *mut ACL, psid: *mut c_void) -
     false
 }
 
+pub unsafe fn dacl_has_read_deny_for_sid(p_dacl: *mut ACL, psid: *mut c_void) -> bool {
+    if p_dacl.is_null() {
+        return false;
+    }
+    let mut info: ACL_SIZE_INFORMATION = std::mem::zeroed();
+    let ok = GetAclInformation(
+        p_dacl as *const ACL,
+        &mut info as *mut _ as *mut c_void,
+        std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+        AclSizeInformation,
+    );
+    if ok == 0 {
+        return false;
+    }
+    let deny_read_mask = FILE_GENERIC_READ | GENERIC_READ_MASK;
+    for i in 0..info.AceCount {
+        let mut p_ace: *mut c_void = std::ptr::null_mut();
+        if GetAce(p_dacl as *const ACL, i, &mut p_ace) == 0 {
+            continue;
+        }
+        let hdr = &*(p_ace as *const ACE_HEADER);
+        if hdr.AceType != ACCESS_DENIED_ACE_TYPE {
+            continue; // ACCESS_DENIED_ACE_TYPE
+        }
+        if (hdr.AceFlags & INHERIT_ONLY_ACE) != 0 {
+            continue;
+        }
+        let ace = &*(p_ace as *const ACCESS_DENIED_ACE);
+        let base = p_ace as usize;
+        let sid_ptr =
+            (base + std::mem::size_of::<ACE_HEADER>() + std::mem::size_of::<u32>()) as *mut c_void;
+        if EqualSid(sid_ptr, psid) != 0 && (ace.Mask & deny_read_mask) != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+// Grant DELETE on each inheriting descendant instead of FILE_DELETE_CHILD on
+// its parent. A parent delete-child grant would bypass a direct deny-write ACE
+// on protected children such as `.git` or an explicit read-only subpath.
 const WRITE_ALLOW_MASK: u32 =
-    FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE | FILE_DELETE_CHILD;
+    FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE;
+
+unsafe fn dacl_allow_mask_needs_refresh(
+    p_dacl: *mut ACL,
+    psid: *mut c_void,
+    allow_mask: u32,
+    disallow_mask: u32,
+) -> bool {
+    !dacl_mask_allows(p_dacl, &[psid], allow_mask, /*require_all_bits*/ true)
+        || dacl_mask_allows_with_scope(
+            p_dacl,
+            &[psid],
+            disallow_mask,
+            /*require_all_bits*/ false,
+            AceScope::Explicit,
+        )
+}
+
+/// Returns whether any provided SID needs its writable-root allow ACE refreshed.
+pub fn path_write_aces_need_refresh(path: &Path, psids: &[*mut c_void]) -> Result<bool> {
+    unsafe {
+        let (p_dacl, p_sd) = fetch_dacl_handle(path)?;
+        let needs_refresh = psids.iter().any(|psid| {
+            dacl_allow_mask_needs_refresh(p_dacl, *psid, WRITE_ALLOW_MASK, FILE_DELETE_CHILD)
+        });
+        if !p_sd.is_null() {
+            LocalFree(p_sd as HLOCAL);
+        }
+        Ok(needs_refresh)
+    }
+}
 
 unsafe fn ensure_allow_mask_aces_with_inheritance_impl(
     path: &Path,
     sids: &[*mut c_void],
     allow_mask: u32,
+    disallow_mask: u32,
     inheritance: u32,
 ) -> Result<bool> {
     let (p_dacl, p_sd) = fetch_dacl_handle(path)?;
     let mut entries: Vec<EXPLICIT_ACCESS_W> = Vec::new();
     for sid in sids {
-        if dacl_mask_allows(p_dacl, &[*sid], allow_mask, /*require_all_bits*/ true) {
+        if !dacl_allow_mask_needs_refresh(p_dacl, *sid, allow_mask, disallow_mask) {
             continue;
         }
         entries.push(EXPLICIT_ACCESS_W {
@@ -344,7 +472,13 @@ pub unsafe fn ensure_allow_mask_aces_with_inheritance(
     allow_mask: u32,
     inheritance: u32,
 ) -> Result<bool> {
-    ensure_allow_mask_aces_with_inheritance_impl(path, sids, allow_mask, inheritance)
+    ensure_allow_mask_aces_with_inheritance_impl(
+        path,
+        sids,
+        allow_mask,
+        /*disallow_mask*/ 0,
+        inheritance,
+    )
 }
 
 /// Ensure all provided SIDs have an allow ACE with the requested mask on the path.
@@ -371,7 +505,13 @@ pub unsafe fn ensure_allow_mask_aces(
 /// # Safety
 /// Caller must pass valid SID pointers and an existing path; free the returned security descriptor with `LocalFree`.
 pub unsafe fn ensure_allow_write_aces(path: &Path, sids: &[*mut c_void]) -> Result<bool> {
-    ensure_allow_mask_aces(path, sids, WRITE_ALLOW_MASK)
+    ensure_allow_mask_aces_with_inheritance_impl(
+        path,
+        sids,
+        WRITE_ALLOW_MASK,
+        FILE_DELETE_CHILD,
+        CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE,
+    )
 }
 
 /// Adds an allow ACE granting read/write/execute to the given SID on the target path.
@@ -445,6 +585,41 @@ pub unsafe fn add_allow_ace(path: &Path, psid: *mut c_void) -> Result<bool> {
 /// # Safety
 /// Caller must ensure `psid` points to a valid SID and `path` refers to an existing file or directory.
 pub unsafe fn add_deny_write_ace(path: &Path, psid: *mut c_void) -> Result<bool> {
+    add_deny_ace(path, psid, DenyAceKind::Write)
+}
+
+#[derive(Clone, Copy)]
+enum DenyAceKind {
+    Read,
+    Write,
+}
+
+impl DenyAceKind {
+    fn mask(self) -> u32 {
+        match self {
+            Self::Read => FILE_GENERIC_READ | GENERIC_READ_MASK,
+            Self::Write => {
+                FILE_GENERIC_WRITE
+                    | FILE_WRITE_DATA
+                    | FILE_APPEND_DATA
+                    | FILE_WRITE_EA
+                    | FILE_WRITE_ATTRIBUTES
+                    | GENERIC_WRITE_MASK
+                    | DELETE
+                    | FILE_DELETE_CHILD
+            }
+        }
+    }
+
+    unsafe fn already_present(self, p_dacl: *mut ACL, psid: *mut c_void) -> bool {
+        match self {
+            Self::Read => dacl_has_read_deny_for_sid(p_dacl, psid),
+            Self::Write => dacl_has_write_deny_for_sid(p_dacl, psid),
+        }
+    }
+}
+
+unsafe fn add_deny_ace(path: &Path, psid: *mut c_void, kind: DenyAceKind) -> Result<bool> {
     let mut p_sd: *mut c_void = std::ptr::null_mut();
     let mut p_dacl: *mut ACL = std::ptr::null_mut();
     let code = GetNamedSecurityInfoW(
@@ -458,10 +633,17 @@ pub unsafe fn add_deny_write_ace(path: &Path, psid: *mut c_void) -> Result<bool>
         &mut p_sd,
     );
     if code != ERROR_SUCCESS {
-        return Err(anyhow!("GetNamedSecurityInfoW failed: {code}"));
+        if !p_sd.is_null() {
+            LocalFree(p_sd as HLOCAL);
+        }
+        return Err(anyhow!(
+            "GetNamedSecurityInfoW failed for {}: {code}",
+            path.display()
+        ));
     }
-    let mut added = false;
-    if !dacl_has_write_deny_for_sid(p_dacl, psid) {
+    let result = if kind.already_present(p_dacl, psid) {
+        Ok(false)
+    } else {
         let trustee = TRUSTEE_W {
             pMultipleTrustee: std::ptr::null_mut(),
             MultipleTrusteeOperation: 0,
@@ -470,20 +652,15 @@ pub unsafe fn add_deny_write_ace(path: &Path, psid: *mut c_void) -> Result<bool>
             ptstrName: psid as *mut u16,
         };
         let mut explicit: EXPLICIT_ACCESS_W = std::mem::zeroed();
-        explicit.grfAccessPermissions = FILE_GENERIC_WRITE
-            | FILE_WRITE_DATA
-            | FILE_APPEND_DATA
-            | FILE_WRITE_EA
-            | FILE_WRITE_ATTRIBUTES
-            | GENERIC_WRITE_MASK
-            | DELETE
-            | FILE_DELETE_CHILD;
+        explicit.grfAccessPermissions = kind.mask();
         explicit.grfAccessMode = DENY_ACCESS;
         explicit.grfInheritance = CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE;
         explicit.Trustee = trustee;
         let mut p_new_dacl: *mut ACL = std::ptr::null_mut();
         let code2 = SetEntriesInAclW(1, &explicit, p_dacl, &mut p_new_dacl);
-        if code2 == ERROR_SUCCESS {
+        let result = if let Err(err) = acl_api_result(path, "SetEntriesInAclW", code2) {
+            Err(err)
+        } else {
             let code3 = SetNamedSecurityInfoW(
                 to_wide(path).as_ptr() as *mut u16,
                 1,
@@ -493,19 +670,35 @@ pub unsafe fn add_deny_write_ace(path: &Path, psid: *mut c_void) -> Result<bool>
                 p_new_dacl,
                 std::ptr::null_mut(),
             );
-            if code3 == ERROR_SUCCESS {
-                added = true;
-            }
-            if !p_new_dacl.is_null() {
-                LocalFree(p_new_dacl as HLOCAL);
-            }
+            acl_api_result(path, "SetNamedSecurityInfoW", code3).map(|()| true)
+        };
+        if !p_new_dacl.is_null() {
+            LocalFree(p_new_dacl as HLOCAL);
         }
-    }
+        result
+    };
     if !p_sd.is_null() {
         LocalFree(p_sd as HLOCAL);
     }
-    Ok(added)
+    result
 }
+
+/// Adds a deny ACE to prevent reads for the given SID on the target path.
+///
+/// `SetEntriesInAclW` places newly-created deny ACEs before allow ACEs, which
+/// keeps the resulting DACL in the order Windows expects for denies to win.
+/// The ACE is inheritable so a deny applied to a materialized directory also
+/// covers files and directories later created underneath it.
+///
+/// # Safety
+/// Caller must ensure `psid` points to a valid SID and `path` refers to an existing file or directory.
+pub unsafe fn add_deny_read_ace(path: &Path, psid: *mut c_void) -> Result<bool> {
+    add_deny_ace(path, psid, DenyAceKind::Read)
+}
+
+#[cfg(test)]
+#[path = "acl_tests.rs"]
+mod tests;
 
 pub unsafe fn revoke_ace(path: &Path, psid: *mut c_void) {
     let mut p_sd: *mut c_void = std::ptr::null_mut();

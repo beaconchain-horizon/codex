@@ -29,19 +29,20 @@
 //!
 //! ## Invariants
 //!
-//! - `emitted_stable_len <= enqueued_stable_len <= rendered_lines.len()`.
-//! - `raw_source` is append-only until `reset()`; never modified mid-stream.
+//! - `emitted_stable_len <= enqueued_stable_len <= render.lines.len()`.
+//! - committed source is append-only until `reset()`; never modified mid-stream.
 //! - Tail starts exactly at `enqueued_stable_len`.
 //! - During confirmed table streaming, only lines from the table header onward
 //!   are forced into tail; pre-table lines may remain stable.
 
 use crate::history_cell::HistoryCell;
 use crate::history_cell::HistoryRenderMode;
-use crate::history_cell::raw_lines_from_source;
 use crate::history_cell::{self};
-use crate::markdown::append_markdown_agent_with_cwd;
-use crate::render::line_utils::prefix_lines;
+use crate::inline_visualization::InlineVisualizationContext;
+use crate::markdown::render_markdown_agent_with_links_cwd_and_visualizations;
 use crate::style::proposed_plan_style;
+use crate::terminal_hyperlinks::HyperlinkLine;
+use crate::terminal_hyperlinks::prefix_hyperlink_lines;
 use ratatui::prelude::Stylize;
 use ratatui::text::Line;
 use std::path::Path;
@@ -50,6 +51,8 @@ use std::time::Duration;
 use std::time::Instant;
 
 use super::StreamState;
+use super::render::StreamingRender;
+use super::render::render_source;
 use super::table_holdback::TableHoldbackScanner;
 use super::table_holdback::TableHoldbackState;
 #[cfg(test)]
@@ -72,16 +75,15 @@ struct StreamCore {
     state: StreamState,
     /// Current rendering width (columns available for markdown content).
     width: Option<usize>,
-    /// Accumulated raw markdown source for the current stream.
-    raw_source: String,
-    /// Full re-render of `raw_source` at `width`. Rebuilt on every committed delta.
-    rendered_lines: Vec<Line<'static>>,
+    /// Incremental render of committed source at `width`.
+    render: StreamingRender,
     /// Lines enqueued into the commit-animation queue.
     enqueued_stable_len: usize,
     /// Lines actually emitted to scrollback.
     emitted_stable_len: usize,
     /// Session cwd used to keep local file-link display stable during stream re-renders.
     cwd: PathBuf,
+    inline_visualization_context: Option<InlineVisualizationContext>,
     render_mode: HistoryRenderMode,
     /// Cached rendered line count for prefix-before-table keyed by source start and width.
     stable_prefix_len_cache: Option<StablePrefixLenCache>,
@@ -90,11 +92,11 @@ struct StreamCore {
 }
 
 struct StablePrefixLenCache {
-    /// Byte offset of the candidate table/header start in `raw_source`.
+    /// Byte offset of the candidate table/header start in committed source.
     source_start: usize,
     /// Width that produced `stable_prefix_len`.
     width: Option<usize>,
-    /// Rendered line count for `raw_source[..source_start]` at `width`.
+    /// Rendered line count for the committed prefix before `source_start` at `width`.
     ///
     /// The streaming controller uses this to avoid repeatedly re-rendering the
     /// same stable prefix while a live table tail is still mutating.
@@ -102,15 +104,20 @@ struct StablePrefixLenCache {
 }
 
 impl StreamCore {
-    fn new(width: Option<usize>, cwd: &Path, render_mode: HistoryRenderMode) -> Self {
+    fn new(
+        width: Option<usize>,
+        cwd: &Path,
+        render_mode: HistoryRenderMode,
+        inline_visualization_context: Option<InlineVisualizationContext>,
+    ) -> Self {
         Self {
             state: StreamState::new(width, cwd),
             width,
-            raw_source: String::with_capacity(1024),
-            rendered_lines: Vec::with_capacity(64),
+            render: StreamingRender::new(),
             enqueued_stable_len: 0,
             emitted_stable_len: 0,
             cwd: cwd.to_path_buf(),
+            inline_visualization_context,
             render_mode,
             stable_prefix_len_cache: None,
             holdback_scanner: TableHoldbackScanner::new(),
@@ -119,7 +126,7 @@ impl StreamCore {
 
     /// Push a streaming delta and enqueue any newly-stable rendered lines.
     ///
-    /// Only newline-terminated source is committed into `raw_source`. This is
+    /// Only newline-terminated source is committed for rendering. This is
     /// important for tables because an unterminated partial row must stay out
     /// of both the stable queue and the live tail until its structure is
     /// unambiguous; otherwise the user can briefly see malformed columns that
@@ -132,11 +139,19 @@ impl StreamCore {
 
         let mut enqueued = false;
         if delta.contains('\n')
-            && let Some(committed_source) = self.state.collector.commit_complete_source()
+            && let Some(range) = self.state.collector.commit_complete_source()
         {
-            self.raw_source.push_str(&committed_source);
-            self.holdback_scanner.push_source_chunk(&committed_source);
-            self.recompute_streaming_render();
+            let source = self.state.collector.committed_source();
+            let committed_source = &source[range];
+            self.holdback_scanner.push_source_chunk(committed_source);
+            self.render.append(
+                source,
+                committed_source,
+                self.width,
+                self.cwd.as_path(),
+                self.render_mode,
+                self.inline_visualization_context.as_ref(),
+            );
             enqueued = self.sync_stable_queue();
         }
         enqueued
@@ -149,29 +164,28 @@ impl StreamCore {
     /// final render is the canonical transcript representation used for
     /// consolidation, so callers that skip `reset()` can accidentally replay a
     /// finished stream into the next answer.
-    fn finalize_remaining(&mut self) -> Vec<Line<'static>> {
-        let remainder_source = self.state.collector.finalize_and_drain_source();
-        if !remainder_source.is_empty() {
-            self.raw_source.push_str(&remainder_source);
-            self.holdback_scanner.push_source_chunk(&remainder_source);
-        }
-        let rendered = self.render_source(&self.raw_source);
-        if self.emitted_stable_len >= rendered.len() {
-            Vec::new()
-        } else {
-            rendered[self.emitted_stable_len..].to_vec()
-        }
+    fn finalize_remaining(&mut self) -> (Vec<HyperlinkLine>, String) {
+        let source = self.state.collector.finalize_and_take_source();
+        let mut rendered = render_source(
+            &source,
+            self.width,
+            self.cwd.as_path(),
+            self.render_mode,
+            self.inline_visualization_context.as_ref(),
+        );
+        let remaining = rendered.split_off(self.emitted_stable_len.min(rendered.len()));
+        (remaining, source)
     }
 
     /// Step animation: dequeue one line, update the emitted count.
-    fn tick(&mut self) -> Vec<Line<'static>> {
+    fn tick(&mut self) -> Vec<HyperlinkLine> {
         let step = self.state.step();
         self.emitted_stable_len += step.len();
         step
     }
 
     /// Batch drain: dequeue up to `max_lines`, update the emitted count.
-    fn tick_batch(&mut self, max_lines: usize) -> Vec<Line<'static>> {
+    fn tick_batch(&mut self, max_lines: usize) -> Vec<HyperlinkLine> {
         if max_lines == 0 {
             return Vec::new();
         }
@@ -209,14 +223,14 @@ impl StreamCore {
     /// `emitted_stable_len` instead, queued-but-not-yet-emitted lines could
     /// reappear in the active cell and duplicate content on screen.
     #[inline]
-    fn current_tail_lines(&self) -> Vec<Line<'static>> {
-        let start = self.enqueued_stable_len.min(self.rendered_lines.len());
-        self.rendered_lines[start..].to_vec()
+    fn current_tail_lines(&self) -> Vec<HyperlinkLine> {
+        let start = self.enqueued_stable_len.min(self.render.lines.len());
+        self.render.lines[start..].to_vec()
     }
 
     #[inline]
     fn has_tail(&self) -> bool {
-        self.enqueued_stable_len < self.rendered_lines.len()
+        self.enqueued_stable_len < self.render.lines.len()
     }
 
     /// Update rendering width and rebuild queued stable lines for the new layout.
@@ -236,14 +250,21 @@ impl StreamCore {
         let had_live_tail = self.has_tail();
         self.width = width;
         self.state.collector.set_width(width);
-        if self.raw_source.is_empty() {
+        let source = self.state.collector.committed_source();
+        if source.is_empty() {
             return;
         }
 
-        self.recompute_streaming_render();
-        self.emitted_stable_len = self.emitted_stable_len.min(self.rendered_lines.len());
+        self.render.recompute(
+            source,
+            self.width,
+            self.cwd.as_path(),
+            self.render_mode,
+            self.inline_visualization_context.as_ref(),
+        );
+        self.emitted_stable_len = self.emitted_stable_len.min(self.render.lines.len());
         if had_pending_queue
-            && self.emitted_stable_len == self.rendered_lines.len()
+            && self.emitted_stable_len == self.render.lines.len()
             && self.emitted_stable_len > 0
         {
             // If wrapped remainder compresses into fewer lines at the new width,
@@ -256,7 +277,7 @@ impl StreamCore {
             // Avoid replaying already-emitted content after resize when no
             // stable lines were waiting in the queue and there was no mutable
             // tail to preserve.
-            self.enqueued_stable_len = self.rendered_lines.len();
+            self.enqueued_stable_len = self.render.lines.len();
             return;
         }
         self.rebuild_stable_queue_from_render();
@@ -265,32 +286,11 @@ impl StreamCore {
     /// Clear all accumulated state for current stream.
     fn reset(&mut self) {
         self.state.clear();
-        self.raw_source.clear();
-        self.rendered_lines.clear();
+        self.render.clear();
         self.enqueued_stable_len = 0;
         self.emitted_stable_len = 0;
         self.stable_prefix_len_cache = None;
         self.holdback_scanner.reset();
-    }
-
-    fn render_source(&self, source: &str) -> Vec<Line<'static>> {
-        match self.render_mode {
-            HistoryRenderMode::Rich => {
-                let mut rendered = Vec::new();
-                append_markdown_agent_with_cwd(
-                    source,
-                    self.width,
-                    Some(self.cwd.as_path()),
-                    &mut rendered,
-                );
-                rendered
-            }
-            HistoryRenderMode::Raw => raw_lines_from_source(source),
-        }
-    }
-
-    fn recompute_streaming_render(&mut self) {
-        self.rendered_lines = self.render_source(&self.raw_source);
     }
 
     fn set_render_mode(&mut self, render_mode: HistoryRenderMode) {
@@ -301,21 +301,28 @@ impl StreamCore {
         let had_pending_queue = self.state.queued_len() > 0;
         let had_live_tail = self.has_tail();
         self.render_mode = render_mode;
-        if self.raw_source.is_empty() {
+        let source = self.state.collector.committed_source();
+        if source.is_empty() {
             return;
         }
 
-        self.recompute_streaming_render();
-        self.emitted_stable_len = self.emitted_stable_len.min(self.rendered_lines.len());
+        self.render.recompute(
+            source,
+            self.width,
+            self.cwd.as_path(),
+            self.render_mode,
+            self.inline_visualization_context.as_ref(),
+        );
+        self.emitted_stable_len = self.emitted_stable_len.min(self.render.lines.len());
         if had_pending_queue
-            && self.emitted_stable_len == self.rendered_lines.len()
+            && self.emitted_stable_len == self.render.lines.len()
             && self.emitted_stable_len > 0
         {
             self.emitted_stable_len -= 1;
         }
         self.state.clear_queue();
         if self.emitted_stable_len > 0 && !had_pending_queue && !had_live_tail {
-            self.enqueued_stable_len = self.rendered_lines.len();
+            self.enqueued_stable_len = self.render.lines.len();
             return;
         }
         self.rebuild_stable_queue_from_render();
@@ -324,7 +331,8 @@ impl StreamCore {
     /// Compute how many rendered lines should be in the stable region.
     fn compute_target_stable_len(&mut self) -> usize {
         let tail_budget = self.active_tail_budget_lines();
-        self.rendered_lines
+        self.render
+            .lines
             .len()
             .saturating_sub(tail_budget)
             .max(self.emitted_stable_len)
@@ -341,7 +349,7 @@ impl StreamCore {
             self.state.clear_queue();
             if self.emitted_stable_len < target_stable_len {
                 self.state.enqueue(
-                    self.rendered_lines[self.emitted_stable_len..target_stable_len].to_vec(),
+                    self.render.lines[self.emitted_stable_len..target_stable_len].to_vec(),
                 );
             }
             self.enqueued_stable_len = target_stable_len;
@@ -353,7 +361,7 @@ impl StreamCore {
         }
 
         self.state
-            .enqueue(self.rendered_lines[self.enqueued_stable_len..target_stable_len].to_vec());
+            .enqueue(self.render.lines[self.enqueued_stable_len..target_stable_len].to_vec());
         self.enqueued_stable_len = target_stable_len;
         true
     }
@@ -368,7 +376,7 @@ impl StreamCore {
         self.state.clear_queue();
         if self.emitted_stable_len < target_stable_len {
             self.state
-                .enqueue(self.rendered_lines[self.emitted_stable_len..target_stable_len].to_vec());
+                .enqueue(self.render.lines[self.emitted_stable_len..target_stable_len].to_vec());
         }
         self.enqueued_stable_len = target_stable_len;
     }
@@ -410,11 +418,11 @@ impl StreamCore {
     /// the only place where those coordinate systems are bridged.
     fn tail_budget_from_source_start(&mut self, source_start: usize) -> usize {
         if source_start == 0 {
-            return self.rendered_lines.len();
+            return self.render.lines.len();
         }
-        let source_start = source_start.min(self.raw_source.len());
+        let source_start = source_start.min(self.state.collector.committed_source().len());
         let stable_prefix_len = self.stable_prefix_len_for_source_start(source_start);
-        self.rendered_lines.len().saturating_sub(stable_prefix_len)
+        self.render.lines.len().saturating_sub(stable_prefix_len)
     }
 
     /// Render the stable prefix before `source_start` and return its line count.
@@ -437,12 +445,12 @@ impl StreamCore {
         }
 
         let render_start = Instant::now();
-        let mut stable_prefix_render = Vec::new();
-        append_markdown_agent_with_cwd(
-            &self.raw_source[..source_start.min(self.raw_source.len())],
+        let source = self.state.collector.committed_source();
+        let stable_prefix_render = render_markdown_agent_with_links_cwd_and_visualizations(
+            &source[..source_start.min(source.len())],
             self.width,
             Some(self.cwd.as_path()),
-            &mut stable_prefix_render,
+            self.inline_visualization_context.as_ref(),
         );
         let stable_prefix_len = stable_prefix_render.len();
         tracing::trace!(
@@ -475,9 +483,24 @@ impl StreamController {
     /// `width` is the content width available to markdown rendering, not necessarily the full
     /// terminal width. Passing a stale width after resize will keep queued live output wrapped for
     /// the old viewport until app-level reflow repairs the finalized transcript.
+    #[cfg(test)]
     pub(crate) fn new(width: Option<usize>, cwd: &Path, render_mode: HistoryRenderMode) -> Self {
+        Self::new_with_inline_visualizations(
+            width,
+            cwd,
+            render_mode,
+            /*inline_visualization_context*/ None,
+        )
+    }
+
+    pub(crate) fn new_with_inline_visualizations(
+        width: Option<usize>,
+        cwd: &Path,
+        render_mode: HistoryRenderMode,
+        inline_visualization_context: Option<InlineVisualizationContext>,
+    ) -> Self {
         Self {
-            core: StreamCore::new(width, cwd, render_mode),
+            core: StreamCore::new(width, cwd, render_mode, inline_visualization_context),
             header_emitted: false,
         }
     }
@@ -489,14 +512,12 @@ impl StreamController {
     /// Finalize the active stream. Returns the final cell (if any remaining lines) and the raw
     /// markdown source for consolidation.
     pub(crate) fn finalize(&mut self) -> (Option<Box<dyn HistoryCell>>, Option<String>) {
-        let remaining = self.core.finalize_remaining();
-        if self.core.raw_source.is_empty() {
+        let (remaining, source) = self.core.finalize_remaining();
+        if source.is_empty() {
             self.core.reset();
             return (None, None);
         }
 
-        // Move ownership — source is consumed before reset() clears it.
-        let source = std::mem::take(&mut self.core.raw_source);
         let out = self.emit(remaining);
         self.core.reset();
         (out, Some(source))
@@ -528,7 +549,7 @@ impl StreamController {
     }
 
     #[inline]
-    pub(crate) fn current_tail_lines(&self) -> Vec<Line<'static>> {
+    pub(crate) fn current_tail_lines(&self) -> Vec<HyperlinkLine> {
         self.core.current_tail_lines()
     }
 
@@ -555,15 +576,17 @@ impl StreamController {
         self.core.set_render_mode(render_mode);
     }
 
-    fn emit(&mut self, lines: Vec<Line<'static>>) -> Option<Box<dyn HistoryCell>> {
+    fn emit(&mut self, lines: Vec<HyperlinkLine>) -> Option<Box<dyn HistoryCell>> {
         if lines.is_empty() {
             return None;
         }
-        Some(Box::new(history_cell::AgentMessageCell::new(lines, {
-            let header_emitted = self.header_emitted;
-            self.header_emitted = true;
-            !header_emitted
-        })))
+        Some(Box::new(
+            history_cell::AgentMessageCell::new_hyperlink_lines(lines, {
+                let header_emitted = self.header_emitted;
+                self.header_emitted = true;
+                !header_emitted
+            }),
+        ))
     }
 }
 // ---------------------------------------------------------------------------
@@ -588,7 +611,12 @@ impl PlanStreamController {
     /// callers must update it when the terminal width changes.
     pub(crate) fn new(width: Option<usize>, cwd: &Path, render_mode: HistoryRenderMode) -> Self {
         Self {
-            core: StreamCore::new(width, cwd, render_mode),
+            core: StreamCore::new(
+                width,
+                cwd,
+                render_mode,
+                /*inline_visualization_context*/ None,
+            ),
             header_emitted: false,
             top_padding_emitted: false,
         }
@@ -601,14 +629,12 @@ impl PlanStreamController {
     /// Finalize the active stream. Returns the final cell (if any remaining
     /// lines) plus raw markdown source for consolidation.
     pub(crate) fn finalize(&mut self) -> (Option<Box<dyn HistoryCell>>, Option<String>) {
-        let remaining = self.core.finalize_remaining();
-        if self.core.raw_source.is_empty() {
+        let (remaining, source) = self.core.finalize_remaining();
+        if source.is_empty() {
             self.core.reset();
             return (None, None);
         }
 
-        // Move ownership — source is consumed before reset() clears it.
-        let source = std::mem::take(&mut self.core.raw_source);
         let out = self.emit(remaining, /*include_bottom_padding*/ true);
         self.core.reset();
         (out, Some(source))
@@ -644,7 +670,7 @@ impl PlanStreamController {
     }
 
     #[inline]
-    pub(crate) fn current_tail_lines(&self) -> Vec<Line<'static>> {
+    pub(crate) fn current_tail_lines(&self) -> Vec<HyperlinkLine> {
         self.core.current_tail_lines()
     }
 
@@ -653,7 +679,7 @@ impl PlanStreamController {
         !self.header_emitted && self.core.enqueued_stable_len == 0
     }
 
-    pub(crate) fn current_tail_display_lines(&self) -> Vec<Line<'static>> {
+    pub(crate) fn current_tail_display_lines(&self) -> Vec<HyperlinkLine> {
         let lines = self.current_tail_lines();
         if lines.is_empty() {
             return Vec::new();
@@ -680,7 +706,7 @@ impl PlanStreamController {
 
     fn emit(
         &mut self,
-        lines: Vec<Line<'static>>,
+        lines: Vec<HyperlinkLine>,
         include_bottom_padding: bool,
     ) -> Option<Box<dyn HistoryCell>> {
         if lines.is_empty() && !include_bottom_padding {
@@ -700,26 +726,28 @@ impl PlanStreamController {
 
     fn render_display_lines(
         &self,
-        lines: Vec<Line<'static>>,
+        lines: Vec<HyperlinkLine>,
         include_bottom_padding: bool,
-    ) -> Vec<Line<'static>> {
-        let mut out_lines: Vec<Line<'static>> = Vec::with_capacity(4);
+    ) -> Vec<HyperlinkLine> {
+        let mut out_lines: Vec<HyperlinkLine> = Vec::with_capacity(/*capacity*/ 4);
         if !self.header_emitted {
-            out_lines.push(vec!["• ".dim(), "Proposed Plan".bold()].into());
-            out_lines.push(Line::from(" "));
+            out_lines.push(HyperlinkLine::new(
+                vec!["• ".dim(), "Proposed Plan".bold()].into(),
+            ));
+            out_lines.push(HyperlinkLine::new(Line::from(" ")));
         }
 
-        let mut plan_lines: Vec<Line<'static>> = Vec::with_capacity(4);
+        let mut plan_lines: Vec<HyperlinkLine> = Vec::with_capacity(/*capacity*/ 4);
         if !self.top_padding_emitted {
-            plan_lines.push(Line::from(" "));
+            plan_lines.push(HyperlinkLine::new(Line::from(" ")));
         }
         plan_lines.extend(lines);
         if include_bottom_padding {
-            plan_lines.push(Line::from(" "));
+            plan_lines.push(HyperlinkLine::new(Line::from(" ")));
         }
 
         let plan_style = proposed_plan_style();
-        let plan_lines = prefix_lines(plan_lines, "  ".into(), "  ".into())
+        let plan_lines = prefix_hyperlink_lines(plan_lines, "  ".into(), "  ".into())
             .into_iter()
             .map(|line| line.style(plan_style))
             .collect::<Vec<_>>();
@@ -731,6 +759,7 @@ impl PlanStreamController {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terminal_hyperlinks::visible_lines;
     use pretty_assertions::assert_eq;
     use std::path::PathBuf;
 
@@ -761,6 +790,10 @@ mod tests {
             .collect()
     }
 
+    fn hyperlink_lines_to_plain_strings(lines: &[HyperlinkLine]) -> Vec<String> {
+        lines_to_plain_strings(&visible_lines(lines.to_vec()))
+    }
+
     fn collect_streamed_lines(deltas: &[&str], width: Option<usize>) -> Vec<String> {
         let mut ctrl = stream_controller(width);
         let mut lines = Vec::new();
@@ -780,6 +813,31 @@ mod tests {
             .into_iter()
             .map(|s| s.chars().skip(2).collect::<String>())
             .collect()
+    }
+
+    #[test]
+    fn queued_heading_is_emitted_once_after_incremental_append() {
+        let mut ctrl = stream_controller(Some(80));
+        assert!(ctrl.push("Paragraph.\n\n# Heading\n\n"));
+        ctrl.push("Next paragraph.\n");
+
+        let (cell, _) = ctrl.on_commit_tick_batch(usize::MAX);
+        let mut streamed = cell
+            .into_iter()
+            .flat_map(|cell| cell.transcript_lines(u16::MAX))
+            .collect::<Vec<_>>();
+        if let (Some(cell), _source) = ctrl.finalize() {
+            streamed.extend(cell.transcript_lines(u16::MAX));
+        }
+        let streamed = lines_to_plain_strings(&streamed);
+        assert_eq!(
+            streamed
+                .iter()
+                .filter(|line| line.contains("# Heading"))
+                .count(),
+            1,
+            "expected the streamed heading to be emitted once: {streamed:?}",
+        );
     }
 
     fn collect_plan_streamed_lines(deltas: &[&str], width: Option<usize>) -> Vec<String> {
@@ -862,7 +920,7 @@ mod tests {
         let mut ctrl = stream_controller(Some(80));
         assert!(!ctrl.has_live_tail());
 
-        ctrl.core.rendered_lines = vec![Line::from("tail line")];
+        ctrl.core.render.lines = vec![Line::from("tail line").into()];
         ctrl.core.enqueued_stable_len = 0;
         assert!(ctrl.has_live_tail());
 
@@ -875,7 +933,7 @@ mod tests {
         let mut ctrl = plan_stream_controller(Some(80));
         assert!(!ctrl.has_live_tail());
 
-        ctrl.core.rendered_lines = vec![Line::from("tail line")];
+        ctrl.core.render.lines = vec![Line::from("tail line").into()];
         ctrl.core.enqueued_stable_len = 0;
         assert!(ctrl.has_live_tail());
 
@@ -890,7 +948,7 @@ mod tests {
         ctrl.push("| --- | --- |\n");
         ctrl.push("| partial");
 
-        let tail = lines_to_plain_strings(&ctrl.current_tail_lines()).join("\n");
+        let tail = hyperlink_lines_to_plain_strings(&ctrl.current_tail_lines()).join("\n");
         assert!(
             !tail.contains("partial"),
             "expected live tail to remain newline-gated: {tail:?}",
@@ -920,11 +978,11 @@ mod tests {
 
         for width in [48, 104, 56] {
             ctrl.set_width(Some(width));
-            let tail = lines_to_plain_strings(&ctrl.current_tail_lines());
+            let tail = hyperlink_lines_to_plain_strings(&ctrl.current_tail_lines());
 
             let mut expected = Vec::new();
             crate::markdown::append_markdown_agent(
-                &ctrl.core.raw_source,
+                ctrl.core.state.collector.committed_source(),
                 Some(width),
                 &mut expected,
             );
@@ -1033,7 +1091,7 @@ mod tests {
 
         ctrl.set_width(Some(24));
 
-        let tail_after = lines_to_plain_strings(&ctrl.current_tail_lines());
+        let tail_after = hyperlink_lines_to_plain_strings(&ctrl.current_tail_lines());
         assert!(
             !tail_after.is_empty(),
             "resize must keep mutable tail when queue is empty",
@@ -1189,6 +1247,7 @@ mod tests {
             "3. Loose item with its own paragraph.".to_string(),
             "".to_string(),
             "   This paragraph belongs to the same list item.".to_string(),
+            "".to_string(),
             "4. Second loose item with a nested list after a blank line.".to_string(),
             "    - Nested bullet under a loose item".to_string(),
             "    - Another nested bullet".to_string(),
@@ -1361,7 +1420,7 @@ mod tests {
     }
 
     #[test]
-    fn controller_renders_unicode_for_multi_table_response_shape() {
+    fn controller_renders_separators_for_multi_table_response_shape() {
         let source = "Absolutely. Here are several different Markdown table patterns you can use for rendering tests.\n\n| Name  | Role      |
   Location |\n|-------|-----------|----------|\n| Ava   | Engineer  | NYC      |\n| Malik | Designer  | Berlin   |\n| Priya | PM        | Remote
   |\n\n| Item        | Qty | Price | In Stock |\n|:------------|----:|------:|:--------:|\n| Keyboard    |   2 | 49.99 |    Yes   |\n| Mouse       |  10
@@ -1377,13 +1436,13 @@ mod tests {
         let deltas = chunked.iter().map(String::as_str).collect::<Vec<_>>();
         let streamed = collect_streamed_lines(&deltas, Some(120));
         assert!(
-            streamed.iter().any(|line| line.contains('┌')),
-            "expected unicode table border in streamed output: {streamed:?}"
+            streamed.iter().any(|line| line.contains('━')),
+            "expected table separator in streamed output: {streamed:?}"
         );
     }
 
     #[test]
-    fn controller_renders_unicode_for_no_outer_pipes_table_shape() {
+    fn controller_renders_separators_for_no_outer_pipes_table_shape() {
         let source = "### 1) Basic\n\n| Name | Role | Active |\n|---|---|---|\n| Alice | Engineer | Yes |\n| Bob | Designer | No |\n\n### 2) No outer
   pipes\n\nCol A | Col B | Col C\n--- | --- | ---\nx | y | z\n10 | 20 | 30\n\n### 3) Another table\n\n| Key | Value |\n|---|---|\n| a | b |\n";
 
@@ -1405,6 +1464,10 @@ mod tests {
         assert!(
             !has_raw_no_outer_header,
             "no-outer-pipes header should not remain raw in final streamed output: {streamed:?}"
+        );
+        assert!(
+            streamed.iter().any(|line| line.contains('━')),
+            "expected table separator in final streamed output: {streamed:?}"
         );
     }
 
@@ -1428,8 +1491,8 @@ mod tests {
 
         assert_eq!(streamed, expected);
         assert!(
-            streamed.iter().any(|line| line.contains('┌')),
-            "expected unicode table border for no-outer-pipes streaming: {streamed:?}"
+            streamed.iter().any(|line| line.contains('━')),
+            "expected table separator for no-outer-pipes streaming: {streamed:?}"
         );
         assert!(
             !streamed
@@ -1457,8 +1520,8 @@ mod tests {
 
         assert_eq!(streamed, expected);
         assert!(
-            streamed.iter().any(|line| line.contains('┌')),
-            "expected unicode table border for two-column no-outer table: {streamed:?}"
+            streamed.iter().any(|line| line.contains('━')),
+            "expected table separator for two-column no-outer table: {streamed:?}"
         );
         assert!(
             !streamed.iter().any(|line| line.trim() == "A | B"),
@@ -1489,8 +1552,8 @@ mod tests {
         assert!(
             streamed
                 .iter()
-                .any(|line| line.contains("┌───────┬───────┬───────┐")),
-            "expected converted no-outer table border in streamed output: {streamed:?}"
+                .any(|line| line.contains(" Col A    Col B    Col C")),
+            "expected converted no-outer table header in streamed output: {streamed:?}"
         );
     }
 
@@ -1512,8 +1575,8 @@ mod tests {
 
         assert_eq!(streamed, expected);
         assert!(
-            streamed.iter().any(|line| line.contains('┌')),
-            "expected unicode table border in streamed output: {streamed:?}"
+            streamed.iter().any(|line| line.contains('━')),
+            "expected table separator in streamed output: {streamed:?}"
         );
         assert!(
             !streamed.iter().any(|line| line.trim() == "| A | B |"),
@@ -1541,8 +1604,8 @@ mod tests {
 
         assert_eq!(streamed, expected);
         assert!(
-            streamed.iter().any(|line| line.contains('┌')),
-            "expected unicode table border in streamed output: {streamed:?}"
+            streamed.iter().any(|line| line.contains('━')),
+            "expected table separator in streamed output: {streamed:?}"
         );
         assert!(
             !streamed
@@ -1580,12 +1643,12 @@ mod tests {
             }
 
             let mut visible = emitted_lines.clone();
-            visible.extend(ctrl.current_tail_lines());
+            visible.extend(visible_lines(ctrl.current_tail_lines()));
             let visible_plain = lines_to_plain_strings(&visible);
 
             let mut expected = Vec::new();
             crate::markdown::append_markdown_agent(
-                &ctrl.core.raw_source,
+                ctrl.core.state.collector.committed_source(),
                 /*width*/ width,
                 &mut expected,
             );
@@ -1596,6 +1659,30 @@ mod tests {
                 "live view diverged after delta: {delta:?}"
             );
         }
+    }
+
+    #[test]
+    fn finalized_stream_table_preserves_semantic_url_fragments() {
+        let destination = "https://example.com/a/very/long/path/to/a/table/artifact";
+        let source = format!("| Item | URL |\n| --- | --- |\n| report | {destination} |\n");
+        let mut ctrl = stream_controller(/*width*/ Some(32));
+        ctrl.push(&source);
+
+        let (cell, _) = ctrl.finalize();
+        let lines = cell
+            .expect("final stream table cell")
+            .display_hyperlink_lines(/*width*/ 32);
+        let linked_rows = lines
+            .iter()
+            .filter(|line| !line.hyperlinks.is_empty())
+            .collect::<Vec<_>>();
+
+        assert!(linked_rows.len() > 1);
+        assert!(linked_rows.iter().all(|line| {
+            line.hyperlinks
+                .iter()
+                .all(|link| link.destination == destination)
+        }));
     }
 
     #[test]
@@ -1620,8 +1707,10 @@ mod tests {
             "expected code-fenced pipe line to remain raw: {streamed:?}"
         );
         assert!(
-            !streamed.iter().any(|line| line.contains('┌')),
-            "did not expect unicode table border for non-markdown fence: {streamed:?}"
+            !streamed
+                .iter()
+                .any(|line| line.contains('━') || line.contains('─')),
+            "did not expect a table separator for non-markdown fence: {streamed:?}"
         );
     }
 
@@ -1642,10 +1731,8 @@ mod tests {
 
         assert_eq!(streamed, baseline);
         assert!(
-            streamed
-                .iter()
-                .any(|line| line.contains('│') || line.contains('└') || line.contains('┌')),
-            "expected unicode table box drawing chars in plan streamed output: {streamed:?}"
+            streamed.iter().any(|line| line.contains('━')),
+            "expected table separators in plan streamed output: {streamed:?}"
         );
         assert!(
             !streamed
@@ -1653,6 +1740,34 @@ mod tests {
                 .any(|line| line.trim() == "| Step | Owner |"),
             "did not expect raw table header line in plan output: {streamed:?}"
         );
+    }
+
+    #[test]
+    fn finalized_plan_stream_preserves_semantic_url_fragments() {
+        let destination = "https://example.com/a/very/long/path/to/a/table/artifact";
+        let source = format!("| Step | URL |\n| --- | --- |\n| Verify | {destination} |\n");
+        let mut ctrl = PlanStreamController::new(
+            /*width*/ Some(32),
+            &test_cwd(),
+            HistoryRenderMode::Rich,
+        );
+        ctrl.push(&source);
+
+        let (cell, _) = ctrl.finalize();
+        let lines = cell
+            .expect("final plan stream table cell")
+            .display_hyperlink_lines(/*width*/ 32);
+        let linked_rows = lines
+            .iter()
+            .filter(|line| !line.hyperlinks.is_empty())
+            .collect::<Vec<_>>();
+
+        assert!(linked_rows.len() > 1);
+        assert!(linked_rows.iter().all(|line| {
+            line.hyperlinks
+                .iter()
+                .all(|link| link.destination == destination)
+        }));
     }
 
     #[test]
@@ -1674,10 +1789,8 @@ mod tests {
 
         assert_eq!(streamed, baseline);
         assert!(
-            streamed
-                .iter()
-                .any(|line| line.contains('│') || line.contains('└') || line.contains('┌')),
-            "expected unicode table box drawing chars in fenced plan output: {streamed:?}"
+            streamed.iter().any(|line| line.contains('━')),
+            "expected table separators in fenced plan output: {streamed:?}"
         );
         assert!(
             !streamed

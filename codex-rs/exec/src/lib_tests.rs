@@ -1,6 +1,9 @@
 use super::*;
+use codex_app_server_protocol::AuthRecoveryNotification;
 use codex_otel::set_parent_from_w3c_trace_context;
 use codex_protocol::config_types::ApprovalsReviewer;
+use codex_protocol::models::ActivePermissionProfile;
+use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
 use codex_utils_absolute_path::test_support::PathBufExt;
 use codex_utils_absolute_path::test_support::test_path_buf;
 use opentelemetry::trace::TraceContextExt;
@@ -19,11 +22,6 @@ fn test_tracing_subscriber() -> impl tracing::Subscriber + Send + Sync {
     let provider = SdkTracerProvider::builder().build();
     let tracer = provider.tracer("codex-exec-tests");
     tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer))
-}
-
-#[test]
-fn exec_defaults_analytics_to_enabled() {
-    assert_eq!(DEFAULT_ANALYTICS_ENABLED, true);
 }
 
 #[derive(Clone)]
@@ -265,6 +263,57 @@ fn lagged_event_warning_message_is_explicit() {
     );
 }
 
+#[test]
+fn runtime_warnings_are_filtered_to_the_primary_thread() {
+    let primary_thread_id = "thread-1";
+    let turn_id = "turn-1";
+    let outcomes = [
+        codex_app_server_protocol::WarningNotification {
+            thread_id: None,
+            message: "global warning".to_string(),
+        },
+        codex_app_server_protocol::WarningNotification {
+            thread_id: Some(primary_thread_id.to_string()),
+            message: "primary warning".to_string(),
+        },
+        codex_app_server_protocol::WarningNotification {
+            thread_id: Some("thread-2".to_string()),
+            message: "other warning".to_string(),
+        },
+    ]
+    .map(|warning| {
+        should_process_notification(
+            &ServerNotification::Warning(warning),
+            primary_thread_id,
+            turn_id,
+        )
+    });
+
+    assert_eq!(outcomes, [true, true, false]);
+
+    let recovery = AuthRecoveryNotification {
+        thread_id: primary_thread_id.to_string(),
+        turn_id: turn_id.to_string(),
+        provider: "example".to_string(),
+        message: "Refresh authentication".to_string(),
+    };
+    let outcomes = [
+        ServerNotification::AuthRecoveryStarted(recovery.clone()),
+        ServerNotification::AuthRecoveryCompleted(recovery.clone()),
+        ServerNotification::AuthRecoveryStarted(AuthRecoveryNotification {
+            thread_id: "thread-2".to_string(),
+            ..recovery.clone()
+        }),
+        ServerNotification::AuthRecoveryCompleted(AuthRecoveryNotification {
+            turn_id: "turn-2".to_string(),
+            ..recovery
+        }),
+    ]
+    .map(|notification| should_process_notification(&notification, primary_thread_id, turn_id));
+
+    assert_eq!(outcomes, [true, true, false, false]);
+}
+
 #[tokio::test]
 async fn resume_lookup_model_providers_filters_only_last_lookup() {
     let codex_home = tempdir().expect("create temp codex home");
@@ -303,18 +352,26 @@ async fn resume_lookup_model_providers_filters_only_last_lookup() {
 fn turn_items_for_thread_returns_matching_turn_items() {
     let thread = AppServerThread {
         id: "thread-1".to_string(),
+        extra: None,
         session_id: "thread-1".to_string(),
         forked_from_id: None,
+        parent_thread_id: None,
         preview: String::new(),
         ephemeral: false,
+        section: None,
+        section_entered_at: None,
+        project_id: None,
+        history_mode: Default::default(),
         model_provider: "openai".to_string(),
         created_at: 0,
         updated_at: 0,
+        recency_at: Some(0),
         status: codex_app_server_protocol::ThreadStatus::Idle,
         path: None,
         cwd: test_path_buf("/tmp/project").abs(),
         cli_version: "0.0.0-test".to_string(),
         source: codex_app_server_protocol::SessionSource::Exec,
+        can_accept_direct_input: None,
         thread_source: None,
         agent_nickname: None,
         agent_role: None,
@@ -329,6 +386,7 @@ fn turn_items_for_thread_returns_matching_turn_items() {
                     text: "hello".to_string(),
                     phase: None,
                     memory_citation: None,
+                    delivery: None,
                 }],
                 status: codex_app_server_protocol::TurnStatus::Completed,
                 error: None,
@@ -359,19 +417,20 @@ fn turn_items_for_thread_returns_matching_turn_items() {
             text: "hello".to_string(),
             phase: None,
             memory_citation: None,
+            delivery: None,
         }])
     );
     assert_eq!(turn_items_for_thread(&thread, "missing-turn"), None);
 }
 
 #[test]
-fn should_backfill_turn_completed_items_skips_ephemeral_threads() {
+fn should_backfill_turn_completed_items_backfills_persisted_summaries_only() {
     let notification =
         ServerNotification::TurnCompleted(codex_app_server_protocol::TurnCompletedNotification {
             thread_id: "thread-1".to_string(),
             turn: codex_app_server_protocol::Turn {
                 id: "turn-1".to_string(),
-                items_view: codex_app_server_protocol::TurnItemsView::Full,
+                items_view: codex_app_server_protocol::TurnItemsView::Summary,
                 items: Vec::new(),
                 status: codex_app_server_protocol::TurnStatus::Completed,
                 error: None,
@@ -383,6 +442,10 @@ fn should_backfill_turn_completed_items_skips_ephemeral_threads() {
 
     assert!(!should_backfill_turn_completed_items(
         /*thread_ephemeral*/ true,
+        &notification
+    ));
+    assert!(should_backfill_turn_completed_items(
+        /*thread_ephemeral*/ false,
         &notification
     ));
 }
@@ -409,6 +472,7 @@ async fn thread_start_params_include_review_policy_when_review_policy_is_manual_
     let codex_home = tempdir().expect("create temp codex home");
     let cwd = tempdir().expect("create temp cwd");
     let config = ConfigBuilder::default()
+        .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
         .codex_home(codex_home.path().to_path_buf())
         .harness_overrides(ConfigOverrides {
             approvals_reviewer: Some(ApprovalsReviewer::User),
@@ -419,7 +483,7 @@ async fn thread_start_params_include_review_policy_when_review_policy_is_manual_
         .await
         .expect("build config with manual-only review policy");
 
-    let params = thread_start_params_from_config(&config);
+    let params = thread_start_params_from_config(&config, &ThreadSource::User);
 
     assert_eq!(
         params.approvals_reviewer,
@@ -447,7 +511,7 @@ async fn thread_start_params_include_review_policy_when_auto_review_is_enabled()
         .await
         .expect("build config with guardian review policy");
 
-    let params = thread_start_params_from_config(&config);
+    let params = thread_start_params_from_config(&config, &ThreadSource::User);
 
     assert_eq!(
         params.approvals_reviewer,
@@ -456,10 +520,199 @@ async fn thread_start_params_include_review_policy_when_auto_review_is_enabled()
 }
 
 #[tokio::test]
+async fn thread_resume_params_only_include_explicit_review_policy_override() {
+    let codex_home = tempdir().expect("create temp codex home");
+    let cwd = tempdir().expect("create temp cwd");
+    let config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .harness_overrides(ConfigOverrides {
+            approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
+            ..Default::default()
+        })
+        .fallback_cwd(Some(cwd.path().to_path_buf()))
+        .build()
+        .await
+        .expect("build config with guardian review policy");
+
+    let params_without_override = thread_resume_params_from_config(
+        &config,
+        "thread-id".to_string(),
+        /*approvals_reviewer_override*/ None,
+    );
+    let params_with_override = thread_resume_params_from_config(
+        &config,
+        "thread-id".to_string(),
+        Some(codex_app_server_protocol::ApprovalsReviewer::AutoReview),
+    );
+
+    assert_eq!(params_without_override.approvals_reviewer, None);
+    assert_eq!(
+        params_with_override.approvals_reviewer,
+        Some(codex_app_server_protocol::ApprovalsReviewer::AutoReview)
+    );
+}
+
+#[tokio::test]
+async fn build_exec_config_retries_without_invalid_headless_policy_for_auto_review() {
+    let codex_home = tempdir().expect("create temp codex home");
+    let cwd = tempdir().expect("create temp cwd");
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        r#"
+approval_policy = "on-request"
+approvals_reviewer = "auto_review"
+"#,
+    )
+    .expect("write config");
+    let requirements_path = codex_home.path().join("requirements.toml");
+    std::fs::write(
+        &requirements_path,
+        r#"
+allowed_approval_policies = ["never", "on-request"]
+allowed_sandbox_modes = ["read-only", "workspace-write"]
+"#,
+    )
+    .expect("write requirements");
+    let mut loader_overrides = LoaderOverrides::without_managed_config_for_tests();
+    loader_overrides.system_requirements_path = Some(requirements_path);
+    let overrides = ConfigOverrides {
+        cwd: Some(cwd.path().to_path_buf()),
+        approval_policy: Some(AskForApproval::Never),
+        sandbox_mode: Some(SandboxMode::DangerFullAccess),
+        ..Default::default()
+    };
+    let build_config = |overrides| {
+        ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .loader_overrides(loader_overrides.clone())
+            .harness_overrides(overrides)
+            .build()
+    };
+
+    let error = build_config(overrides.clone())
+        .await
+        .expect_err("synthetic headless approval policy should fail");
+    assert!(
+        error
+            .to_string()
+            .contains("`approval_policy = \"never\"` cannot be used")
+    );
+
+    let config = build_exec_config(
+        overrides,
+        /*preserve_headless_approval_policy*/ false,
+        build_config,
+    )
+    .await
+    .expect("auto-review config should retry without the synthetic approval policy");
+
+    assert_eq!(
+        config.permissions.approval_policy.value(),
+        AskForApproval::OnRequest
+    );
+    assert_eq!(config.approvals_reviewer, ApprovalsReviewer::AutoReview);
+}
+
+#[tokio::test]
+async fn build_exec_config_preserves_headless_error_when_retry_fails() {
+    let overrides = ConfigOverrides {
+        approval_policy: Some(AskForApproval::Never),
+        ..Default::default()
+    };
+
+    let error = build_exec_config(
+        overrides,
+        /*preserve_headless_approval_policy*/ false,
+        |overrides| async move {
+            let message = if overrides.approval_policy == Some(AskForApproval::Never) {
+                "headless error"
+            } else {
+                "retry error"
+            };
+            Err(std::io::Error::other(message))
+        },
+    )
+    .await
+    .expect_err("failed speculative retry should preserve the original error");
+
+    assert_eq!(error.to_string(), "headless error");
+}
+
+#[tokio::test]
+async fn thread_start_params_match_history_to_persistence() {
+    let codex_home = tempdir().expect("create temp codex home");
+    let cwd = tempdir().expect("create temp cwd");
+    let mut config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(cwd.path().to_path_buf()))
+        .build()
+        .await
+        .expect("build config");
+
+    let params = thread_start_params_from_config(&config, &ThreadSource::User);
+
+    assert_eq!(
+        params.thread_source,
+        Some(codex_app_server_protocol::ThreadSource::User)
+    );
+    assert_eq!(params.history_mode, Some(ThreadHistoryMode::Paginated));
+
+    let thread_source = ThreadSource::Feature("automated_review".to_string());
+    let params = thread_start_params_from_config(&config, &thread_source);
+    assert_eq!(params.thread_source, Some(thread_source));
+
+    config.ephemeral = true;
+    let params = thread_start_params_from_config(&config, &ThreadSource::User);
+
+    assert_eq!(params.ephemeral, Some(true));
+    assert_eq!(params.history_mode, None);
+}
+
+#[tokio::test]
+async fn thread_lifecycle_params_preserve_hook_trust_bypass() {
+    let codex_home = tempdir().expect("create temp codex home");
+    let cwd = tempdir().expect("create temp cwd");
+    let config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .harness_overrides(ConfigOverrides {
+            bypass_hook_trust: Some(true),
+            ..Default::default()
+        })
+        .fallback_cwd(Some(cwd.path().to_path_buf()))
+        .build()
+        .await
+        .expect("build config with hook trust bypass");
+    let expected_config = Some(HashMap::from([(
+        "bypass_hook_trust".to_string(),
+        serde_json::Value::Bool(true),
+    )]));
+
+    let start_params = thread_start_params_from_config(&config, &ThreadSource::User);
+    let resume_params = thread_resume_params_from_config(
+        &config,
+        "thread-id".to_string(),
+        /*approvals_reviewer_override*/ None,
+    );
+
+    assert_eq!(start_params.config, expected_config);
+    assert_eq!(resume_params.config, expected_config);
+}
+
+#[test]
+fn active_profile_selection_uses_profile_id_only() {
+    let selection = permission_profile_id_from_active_profile(ActivePermissionProfile::new(
+        BUILT_IN_PERMISSION_PROFILE_WORKSPACE,
+    ));
+
+    assert_eq!(selection, BUILT_IN_PERMISSION_PROFILE_WORKSPACE.to_string());
+}
+
+#[tokio::test]
 async fn thread_lifecycle_params_include_legacy_sandbox_when_no_active_profile() {
     let codex_home = tempdir().expect("create temp codex home");
     let cwd = tempdir().expect("create temp cwd");
     let config = ConfigBuilder::default()
+        .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
         .codex_home(codex_home.path().to_path_buf())
         .harness_overrides(ConfigOverrides {
             sandbox_mode: Some(SandboxMode::DangerFullAccess),
@@ -470,8 +723,12 @@ async fn thread_lifecycle_params_include_legacy_sandbox_when_no_active_profile()
         .await
         .expect("build config with legacy sandbox override");
 
-    let start_params = thread_start_params_from_config(&config);
-    let resume_params = thread_resume_params_from_config(&config, "thread-id".to_string());
+    let start_params = thread_start_params_from_config(&config, &ThreadSource::User);
+    let resume_params = thread_resume_params_from_config(
+        &config,
+        "thread-id".to_string(),
+        /*approvals_reviewer_override*/ None,
+    );
 
     assert_eq!(config.permissions.active_permission_profile(), None);
     assert_eq!(
@@ -513,7 +770,7 @@ async fn session_configured_from_thread_response_uses_review_policy_from_respons
 }
 
 #[tokio::test]
-async fn session_configured_from_thread_response_uses_permission_profile_from_response() {
+async fn session_configured_from_thread_response_uses_permission_profile_from_config() {
     let codex_home = tempdir().expect("create temp codex home");
     let cwd = tempdir().expect("create temp cwd");
     let config = ConfigBuilder::default()
@@ -522,32 +779,86 @@ async fn session_configured_from_thread_response_uses_permission_profile_from_re
         .build()
         .await
         .expect("build config");
-    let mut response = sample_thread_start_response();
-    response.permission_profile = Some(PermissionProfile::Disabled.into());
+    let response = sample_thread_start_response();
 
     let event = session_configured_from_thread_start_response(&response, &config)
         .expect("build bootstrap session configured event");
 
-    assert_eq!(event.permission_profile, PermissionProfile::Disabled);
+    assert_eq!(
+        event.permission_profile,
+        config.permissions.effective_permission_profile()
+    );
+}
+
+#[tokio::test]
+async fn session_configured_from_thread_response_preserves_thread_source() {
+    let codex_home = tempdir().expect("create temp codex home");
+    let cwd = tempdir().expect("create temp cwd");
+    let config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(cwd.path().to_path_buf()))
+        .build()
+        .await
+        .expect("build config");
+    let response = sample_thread_start_response();
+
+    let event = session_configured_from_thread_start_response(&response, &config)
+        .expect("build bootstrap session configured event");
+
+    assert_eq!(
+        event.thread_source,
+        Some(codex_protocol::protocol::ThreadSource::User)
+    );
+}
+
+#[tokio::test]
+async fn session_configured_from_thread_response_preserves_parent_thread_id() {
+    let codex_home = tempdir().expect("create temp codex home");
+    let cwd = tempdir().expect("create temp cwd");
+    let config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(cwd.path().to_path_buf()))
+        .build()
+        .await
+        .expect("build config");
+    let parent_thread_id = ThreadId::new();
+    let forked_from_id = ThreadId::new();
+    let mut response = sample_thread_start_response();
+    response.thread.parent_thread_id = Some(parent_thread_id.to_string());
+    response.thread.forked_from_id = Some(forked_from_id.to_string());
+
+    let event = session_configured_from_thread_start_response(&response, &config)
+        .expect("build bootstrap session configured event");
+
+    assert_eq!(event.parent_thread_id, Some(parent_thread_id));
+    assert_eq!(event.forked_from_id, Some(forked_from_id));
 }
 
 fn sample_thread_start_response() -> ThreadStartResponse {
     ThreadStartResponse {
         thread: codex_app_server_protocol::Thread {
             id: "67e55044-10b1-426f-9247-bb680e5fe0c8".to_string(),
+            extra: None,
             session_id: "67e55044-10b1-426f-9247-bb680e5fe0c7".to_string(),
             forked_from_id: None,
+            parent_thread_id: None,
             preview: String::new(),
             ephemeral: false,
+            section: None,
+            section_entered_at: None,
+            project_id: None,
+            history_mode: Default::default(),
             model_provider: "openai".to_string(),
             created_at: 0,
             updated_at: 0,
+            recency_at: Some(0),
             status: codex_app_server_protocol::ThreadStatus::Idle,
             path: Some(PathBuf::from("/tmp/rollout.jsonl")),
             cwd: test_path_buf("/tmp").abs(),
             cli_version: "0.0.0".to_string(),
             source: codex_app_server_protocol::SessionSource::Cli,
-            thread_source: None,
+            can_accept_direct_input: None,
+            thread_source: Some(codex_app_server_protocol::ThreadSource::User),
             agent_nickname: None,
             agent_role: None,
             git_info: None,
@@ -558,6 +869,7 @@ fn sample_thread_start_response() -> ThreadStartResponse {
         model_provider: "openai".to_string(),
         service_tier: None,
         cwd: test_path_buf("/tmp").abs(),
+        runtime_workspace_roots: Vec::new(),
         instruction_sources: Vec::new(),
         approval_policy: codex_app_server_protocol::AskForApproval::OnRequest,
         approvals_reviewer: codex_app_server_protocol::ApprovalsReviewer::AutoReview,
@@ -567,8 +879,8 @@ fn sample_thread_start_response() -> ThreadStartResponse {
             exclude_tmpdir_env_var: false,
             exclude_slash_tmp: false,
         },
-        permission_profile: None,
         active_permission_profile: None,
         reasoning_effort: None,
+        multi_agent_mode: Default::default(),
     }
 }

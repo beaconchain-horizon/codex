@@ -1,11 +1,17 @@
 use codex_protocol::config_types::ModeKind;
-use codex_protocol::request_user_input::RequestUserInputArgs;
+use codex_protocol::request_user_input::RequestUserInputQuestion;
 use codex_tools::JsonSchema;
 use codex_tools::ResponsesApiTool;
 use codex_tools::ToolSpec;
+use serde::Deserialize;
 use std::collections::BTreeMap;
 
 pub const REQUEST_USER_INPUT_TOOL_NAME: &str = "request_user_input";
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub(crate) struct RequestUserInputToolArgs {
+    pub questions: Vec<RequestUserInputQuestion>,
+}
 
 pub fn create_request_user_input_tool(description: String) -> ToolSpec {
     let option_props = BTreeMap::from([
@@ -96,9 +102,9 @@ pub fn request_user_input_unavailable_message(
     }
 }
 
-pub fn normalize_request_user_input_args(
-    mut args: RequestUserInputArgs,
-) -> Result<RequestUserInputArgs, String> {
+pub(crate) fn normalize_request_user_input_tool_args(
+    mut args: RequestUserInputToolArgs,
+) -> Result<RequestUserInputToolArgs, String> {
     let missing_options = args
         .questions
         .iter()

@@ -29,6 +29,8 @@ use crate::app::app_server_requests::ResolvedAppServerRequest;
 use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
 use crate::key_hint;
+use crate::keymap::ListAction;
+use crate::keymap::ListKeymap;
 use crate::render::Insets;
 use crate::render::RectExt as _;
 use crate::style::user_message_style;
@@ -238,10 +240,24 @@ pub(crate) struct AppLinkView {
     screen: AppLinkScreen,
     selected_action: usize,
     complete: bool,
+    list_keymap: ListKeymap,
 }
 
 impl AppLinkView {
+    #[cfg(test)]
     pub(crate) fn new(params: AppLinkViewParams, app_event_tx: AppEventSender) -> Self {
+        Self::new_with_keymap(
+            params,
+            app_event_tx,
+            crate::keymap::RuntimeKeymap::defaults().list,
+        )
+    }
+
+    pub(crate) fn new_with_keymap(
+        params: AppLinkViewParams,
+        app_event_tx: AppEventSender,
+        list_keymap: ListKeymap,
+    ) -> Self {
         let AppLinkViewParams {
             app_id,
             title,
@@ -269,6 +285,7 @@ impl AppLinkView {
             screen: AppLinkScreen::Link,
             selected_action: 0,
             complete: false,
+            list_keymap,
         }
     }
 
@@ -652,23 +669,29 @@ impl AppLinkView {
     }
 
     fn hint_line(&self) -> Line<'static> {
-        Line::from(vec![
-            "Use ".into(),
-            key_hint::plain(KeyCode::Tab).into(),
-            " / ".into(),
-            key_hint::plain(KeyCode::Up).into(),
-            " ".into(),
-            key_hint::plain(KeyCode::Down).into(),
-            " to move, ".into(),
-            key_hint::plain(KeyCode::Enter).into(),
-            " to select, ".into(),
-            key_hint::plain(KeyCode::Esc).into(),
-            " to close".into(),
-        ])
+        let mut spans = vec!["Use ".into(), key_hint::plain(KeyCode::Tab).into()];
+        if let Some(move_up) = self.list_keymap.primary_hint(ListAction::MoveUp) {
+            spans.extend([" / ".into(), move_up.into()]);
+        }
+        if let Some(move_down) = self.list_keymap.primary_hint(ListAction::MoveDown) {
+            spans.extend([" ".into(), move_down.into()]);
+        }
+        spans.push(" to move".into());
+        if let Some(accept) = self.list_keymap.primary_hint(ListAction::Accept) {
+            spans.extend([", ".into(), accept.into(), " to select".into()]);
+        }
+        if let Some(cancel) = self.list_keymap.primary_hint(ListAction::Cancel) {
+            spans.extend([", ".into(), cancel.into(), " to close".into()]);
+        }
+        Line::from(spans)
     }
 }
 
 impl BottomPaneView for AppLinkView {
+    fn keymap_contexts(&self) -> crate::keymap::KeymapContextSet {
+        crate::keymap::KeymapContextSet::new(crate::keymap::KeymapContext::List)
+    }
+
     fn handle_key_event(&mut self, key_event: KeyEvent) {
         match key_event {
             KeyEvent {
@@ -676,12 +699,11 @@ impl BottomPaneView for AppLinkView {
             } => {
                 self.on_ctrl_c();
             }
+            _ if self.list_keymap.action_for(key_event) == Some(ListAction::Cancel) => {
+                self.on_ctrl_c();
+            }
             KeyEvent {
                 code: KeyCode::Up, ..
-            }
-            | KeyEvent {
-                code: KeyCode::Left,
-                ..
             }
             | KeyEvent {
                 code: KeyCode::BackTab,
@@ -691,18 +713,16 @@ impl BottomPaneView for AppLinkView {
                 code: KeyCode::Char('k'),
                 modifiers: KeyModifiers::NONE,
                 ..
-            }
-            | KeyEvent {
-                code: KeyCode::Char('h'),
-                modifiers: KeyModifiers::NONE,
-                ..
             } => self.move_selection_prev(),
+            _ if matches!(
+                self.list_keymap.action_for(key_event),
+                Some(ListAction::MoveUp | ListAction::MoveLeft)
+            ) =>
+            {
+                self.move_selection_prev()
+            }
             KeyEvent {
                 code: KeyCode::Down,
-                ..
-            }
-            | KeyEvent {
-                code: KeyCode::Right,
                 ..
             }
             | KeyEvent {
@@ -712,12 +732,17 @@ impl BottomPaneView for AppLinkView {
                 code: KeyCode::Char('j'),
                 modifiers: KeyModifiers::NONE,
                 ..
-            }
-            | KeyEvent {
-                code: KeyCode::Char('l'),
-                modifiers: KeyModifiers::NONE,
-                ..
             } => self.move_selection_next(),
+            _ if matches!(
+                self.list_keymap.action_for(key_event),
+                Some(ListAction::MoveDown | ListAction::MoveRight)
+            ) =>
+            {
+                self.move_selection_next()
+            }
+            _ if self.list_keymap.action_for(key_event) == Some(ListAction::Accept) => {
+                self.activate_selected_action();
+            }
             KeyEvent {
                 code: KeyCode::Char(c),
                 modifiers: KeyModifiers::NONE,
@@ -813,6 +838,7 @@ impl crate::render::renderable::Renderable for AppLinkView {
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .render(inner, buf);
+        crate::terminal_hyperlinks::mark_url_hyperlink(buf, inner, &self.url);
 
         if actions_area.height > 0 {
             let actions_area = Rect {
@@ -1004,7 +1030,10 @@ mod tests {
                         if symbol.is_empty() {
                             ' '
                         } else {
-                            symbol.chars().next().unwrap_or(' ')
+                            crate::terminal_hyperlinks::strip_osc8(symbol)
+                                .chars()
+                                .next()
+                                .unwrap_or(' ')
                         }
                     })
                     .collect::<String>()
@@ -1085,6 +1114,74 @@ mod tests {
         );
 
         assert!(view.terminal_title_requires_action());
+    }
+
+    #[test]
+    fn horizontal_list_keys_move_action_selection() {
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let mut view = AppLinkView::new(
+            AppLinkViewParams {
+                app_id: "connector_1".to_string(),
+                title: "Notion".to_string(),
+                description: None,
+                instructions: "Manage app".to_string(),
+                url: "https://example.test/notion".to_string(),
+                is_installed: true,
+                is_enabled: true,
+                suggest_reason: None,
+                suggestion_type: None,
+                elicitation_target: None,
+            },
+            tx,
+        );
+
+        assert_eq!(view.selected_action, 0);
+        view.handle_key_event(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
+        assert_eq!(view.selected_action, 1);
+        view.handle_key_event(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+        assert_eq!(view.selected_action, 0);
+    }
+
+    #[test]
+    fn remapped_horizontal_list_keys_control_action_selection() {
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let mut list_keymap = crate::keymap::RuntimeKeymap::defaults().list;
+        list_keymap.move_left = vec![key_hint::plain(KeyCode::Char('x'))];
+        list_keymap.move_right = vec![key_hint::plain(KeyCode::Char('z'))];
+        let mut view = AppLinkView::new_with_keymap(
+            AppLinkViewParams {
+                app_id: "connector_1".to_string(),
+                title: "Notion".to_string(),
+                description: None,
+                instructions: "Manage app".to_string(),
+                url: "https://example.test/notion".to_string(),
+                is_installed: true,
+                is_enabled: true,
+                suggest_reason: None,
+                suggestion_type: None,
+                elicitation_target: None,
+            },
+            tx,
+            list_keymap,
+        );
+
+        assert_eq!(view.selected_action, 0);
+        view.handle_key_event(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert_eq!(view.selected_action, 0);
+        view.handle_key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(view.selected_action, 0);
+
+        view.handle_key_event(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+        assert_eq!(view.selected_action, 1);
+        view.handle_key_event(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        assert_eq!(view.selected_action, 1);
+        view.handle_key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(view.selected_action, 1);
+
+        view.handle_key_event(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(view.selected_action, 0);
     }
 
     #[test]
@@ -1256,7 +1353,10 @@ mod tests {
                         if symbol.is_empty() {
                             ' '
                         } else {
-                            symbol.chars().next().unwrap_or(' ')
+                            crate::terminal_hyperlinks::strip_osc8(symbol)
+                                .chars()
+                                .next()
+                                .unwrap_or(' ')
                         }
                     })
                     .collect::<String>()

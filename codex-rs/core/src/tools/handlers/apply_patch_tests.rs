@@ -1,9 +1,10 @@
 use super::*;
 use codex_apply_patch::MaybeApplyPatchVerified;
 use codex_exec_server::LOCAL_FS;
+use codex_protocol::permissions::FileSystemAccessMode;
+use codex_protocol::permissions::FileSystemSandboxEntry;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::protocol::FileChange;
-use codex_protocol::protocol::SandboxPolicy;
 use core_test_support::PathBufExt;
 use core_test_support::PathExt;
 use pretty_assertions::assert_eq;
@@ -14,6 +15,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::sync::Mutex;
 
+use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
 use crate::tools::context::ToolInvocation;
 use crate::tools::hook_names::HookToolName;
@@ -30,9 +32,11 @@ fn sample_patch() -> &'static str {
 
 async fn invocation_for_payload(payload: ToolPayload) -> ToolInvocation {
     let (session, turn) = make_session_and_context().await;
+    let turn = Arc::new(turn);
     ToolInvocation {
         session: session.into(),
-        turn: turn.into(),
+        step_context: StepContext::for_test(Arc::clone(&turn)),
+        turn,
         cancellation_token: tokio_util::sync::CancellationToken::new(),
         tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
         call_id: "call-apply-patch".to_string(),
@@ -43,13 +47,31 @@ async fn invocation_for_payload(payload: ToolPayload) -> ToolInvocation {
 }
 
 #[tokio::test]
+async fn file_update_mode_follows_preserve_line_endings_feature() {
+    let (_, mut turn) = make_session_and_context().await;
+    assert_eq!(
+        apply_patch_file_update_mode(&turn),
+        codex_apply_patch::ApplyPatchFileUpdateMode::NormalizeToLf
+    );
+
+    Arc::make_mut(&mut turn.config)
+        .features
+        .enable(codex_features::Feature::ApplyPatchPreserveLineEndings)
+        .expect("feature should be enabled");
+    assert_eq!(
+        apply_patch_file_update_mode(&turn),
+        codex_apply_patch::ApplyPatchFileUpdateMode::PreserveLineEndings
+    );
+}
+
+#[tokio::test]
 async fn pre_tool_use_payload_uses_freeform_patch_input() {
     let patch = sample_patch();
     let payload = ToolPayload::Custom {
         input: patch.to_string(),
     };
     let invocation = invocation_for_payload(payload).await;
-    let handler = ApplyPatchHandler;
+    let handler = ApplyPatchHandler::default();
 
     assert_eq!(
         handler.pre_tool_use_payload(&invocation),
@@ -68,7 +90,7 @@ async fn post_tool_use_payload_uses_patch_input_and_tool_output() {
     };
     let invocation = invocation_for_payload(payload).await;
     let output = ApplyPatchToolOutput::from_text("Success. Updated files.".to_string());
-    let handler = ApplyPatchHandler;
+    let handler = ApplyPatchHandler::default();
 
     assert_eq!(
         handler.post_tool_use_payload(&invocation, &output),
@@ -136,6 +158,32 @@ fn diff_consumer_streams_apply_patch_changes() {
 }
 
 #[test]
+fn diff_consumer_streams_apply_patch_changes_with_environment_header() {
+    let mut consumer = ApplyPatchArgumentDiffConsumer::default();
+    assert!(
+        consumer
+            .push_delta(
+                "call-1".to_string(),
+                "*** Begin Patch\n*** Environment ID: remote\n",
+            )
+            .is_none()
+    );
+
+    let event = consumer
+        .push_delta("call-1".to_string(), "*** Add File: hello.txt\n+hello")
+        .expect("progress event");
+    assert_eq!(
+        event.changes,
+        HashMap::from([(
+            PathBuf::from("hello.txt"),
+            FileChange::Add {
+                content: String::new(),
+            },
+        )])
+    );
+}
+
+#[test]
 fn diff_consumer_sends_next_update_after_buffer_interval() {
     let mut consumer = ApplyPatchArgumentDiffConsumer::default();
     consumer.push_delta("call-1".to_string(), "*** Begin Patch\n");
@@ -168,6 +216,22 @@ fn diff_consumer_sends_next_update_after_buffer_interval() {
     );
 }
 
+#[test]
+fn reconcile_environment_id_requires_selection_when_enabled() {
+    assert_eq!(
+        require_environment_id(Some("remote"), /*allow_environment_id*/ false),
+        Err(FunctionCallError::RespondToModel(
+            "apply_patch environment selection is unavailable for this turn".to_string(),
+        ))
+    );
+    assert_eq!(
+        require_environment_id(
+            /*parsed_environment_id*/ None, /*allow_environment_id*/ true
+        ),
+        Ok(None)
+    );
+}
+
 #[tokio::test]
 async fn approval_keys_include_move_destination() {
     let tmp = TempDir::new().expect("tmp");
@@ -184,6 +248,8 @@ async fn approval_keys_include_move_destination() {
 +new content
 *** End Patch"#;
     let argv = vec!["apply_patch".to_string(), patch.to_string()];
+    // TODO(anp): Keep apply_patch handler test cwd values as PathUri.
+    let cwd = PathUri::from_abs_path(&cwd);
     let action = match codex_apply_patch::maybe_parse_apply_patch_verified(
         &argv,
         &cwd,
@@ -209,12 +275,11 @@ fn write_permissions_for_paths_skip_dirs_already_writable_under_workspace_root()
     std::fs::create_dir_all(&nested).expect("create nested dir");
     let file_path = AbsolutePathBuf::try_from(nested.join("file.txt"))
         .expect("nested file path should be absolute");
-    let sandbox_policy = FileSystemSandboxPolicy::from(&SandboxPolicy::WorkspaceWrite {
-        writable_roots: vec![],
-        network_access: false,
-        exclude_tmpdir_env_var: true,
-        exclude_slash_tmp: false,
-    });
+    let sandbox_policy = FileSystemSandboxPolicy::workspace_write(
+        &[],
+        /*exclude_tmpdir_env_var*/ true,
+        /*exclude_slash_tmp*/ false,
+    );
 
     let permissions = write_permissions_for_paths(&[file_path], &sandbox_policy, &cwd);
 
@@ -231,12 +296,11 @@ fn write_permissions_for_paths_keep_dirs_outside_workspace_root() {
     let file_path = AbsolutePathBuf::try_from(outside.join("file.txt"))
         .expect("outside file path should be absolute");
     let cwd_abs = cwd.abs();
-    let sandbox_policy = FileSystemSandboxPolicy::from(&SandboxPolicy::WorkspaceWrite {
-        writable_roots: vec![],
-        network_access: false,
-        exclude_tmpdir_env_var: true,
-        exclude_slash_tmp: true,
-    });
+    let sandbox_policy = FileSystemSandboxPolicy::workspace_write(
+        &[],
+        /*exclude_tmpdir_env_var*/ true,
+        /*exclude_slash_tmp*/ true,
+    );
 
     let permissions = write_permissions_for_paths(&[file_path], &sandbox_policy, &cwd_abs);
     let expected_outside =
@@ -246,7 +310,39 @@ fn write_permissions_for_paths_keep_dirs_outside_workspace_root() {
         permissions
             .and_then(|profile| profile.file_system)
             .and_then(|fs| fs.legacy_read_write_roots())
-            .and_then(|(_read, write)| write),
+            .and_then(|roots| roots.write),
         Some(vec![expected_outside])
     );
+}
+
+#[test]
+fn write_permissions_for_paths_do_not_widen_workspace_root_target() {
+    let tmp = TempDir::new().expect("tmp");
+    let cwd = tmp.path().join("workspace").abs();
+    std::fs::create_dir_all(&cwd).expect("create workspace");
+    let sandbox_policy = FileSystemSandboxPolicy::workspace_write(
+        &[],
+        /*exclude_tmpdir_env_var*/ true,
+        /*exclude_slash_tmp*/ true,
+    );
+
+    let permissions =
+        write_permissions_for_paths(std::slice::from_ref(&cwd), &sandbox_policy, &cwd);
+
+    assert_eq!(permissions, None);
+}
+
+#[test]
+fn write_permissions_for_paths_do_not_regrant_an_already_writable_parent() {
+    let tmp = TempDir::new().expect("tmp");
+    let cwd = tmp.path().abs();
+    let file_path = cwd.join("protected.txt");
+    let sandbox_policy = FileSystemSandboxPolicy::restricted(vec![
+        FileSystemSandboxEntry::new(cwd.clone().into(), FileSystemAccessMode::Write),
+        FileSystemSandboxEntry::new(file_path.clone().into(), FileSystemAccessMode::Read),
+    ]);
+
+    let permissions = write_permissions_for_paths(&[file_path], &sandbox_policy, &cwd);
+
+    assert_eq!(permissions, None);
 }

@@ -6,19 +6,24 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from identifier_validation import validate_marketplace_name
+
 
 MAX_PLUGIN_NAME_LENGTH = 64
-DEFAULT_PLUGIN_PARENT = Path.cwd() / "plugins"
-DEFAULT_MARKETPLACE_PATH = Path.cwd() / ".agents" / "plugins" / "marketplace.json"
 DEFAULT_INSTALL_POLICY = "AVAILABLE"
 DEFAULT_AUTH_POLICY = "ON_INSTALL"
 DEFAULT_CATEGORY = "Productivity"
-DEFAULT_MARKETPLACE_DISPLAY_NAME = "[TODO: Marketplace Display Name]"
+DEFAULT_MARKETPLACE_NAME = "personal"
 VALID_INSTALL_POLICIES = {"NOT_AVAILABLE", "AVAILABLE", "INSTALLED_BY_DEFAULT"}
 VALID_AUTH_POLICIES = {"ON_INSTALL", "ON_USE"}
+DEFAULT_PLUGIN_PARENT = Path.home() / "plugins"
+DEFAULT_MARKETPLACE_PATH = Path.home() / ".agents" / "plugins" / "marketplace.json"
 
 
 def normalize_plugin_name(plugin_name: str) -> str:
@@ -40,49 +45,35 @@ def validate_plugin_name(plugin_name: str) -> None:
         )
 
 
-def build_plugin_json(plugin_name: str) -> dict:
-    return {
+def display_name_from_plugin_name(plugin_name: str) -> str:
+    return " ".join(part.capitalize() for part in re.split(r"[-_]+", plugin_name))
+
+
+def build_plugin_json(plugin_name: str, *, with_mcp: bool, with_apps: bool) -> dict[str, Any]:
+    display_name = display_name_from_plugin_name(plugin_name)
+    payload: dict[str, Any] = {
         "name": plugin_name,
-        "version": "[TODO: 1.2.0]",
-        "description": "[TODO: Brief plugin description]",
+        "version": "0.1.0",
+        "description": f"{display_name} plugin",
         "author": {
-            "name": "[TODO: Author Name]",
-            "email": "[TODO: author@example.com]",
-            "url": "[TODO: https://github.com/author]",
+            "name": "Local developer",
         },
-        "homepage": "[TODO: https://docs.example.com/plugin]",
-        "repository": "[TODO: https://github.com/author/plugin]",
-        "license": "[TODO: MIT]",
-        "keywords": ["[TODO: keyword1]", "[TODO: keyword2]"],
-        "skills": "[TODO: ./skills/]",
-        "hooks": "[TODO: ./hooks.json]",
-        "mcpServers": "[TODO: ./.mcp.json]",
-        "apps": "[TODO: ./.app.json]",
+        "skills": "./skills/",
         "interface": {
-            "displayName": "[TODO: Plugin Display Name]",
-            "shortDescription": "[TODO: Short description for subtitle]",
-            "longDescription": "[TODO: Long description for details page]",
-            "developerName": "[TODO: OpenAI]",
-            "category": "[TODO: Productivity]",
-            "capabilities": ["[TODO: Interactive]", "[TODO: Write]"],
-            "websiteURL": "[TODO: https://openai.com/]",
-            "privacyPolicyURL": "[TODO: https://openai.com/policies/row-privacy-policy/]",
-            "termsOfServiceURL": "[TODO: https://openai.com/policies/row-terms-of-use/]",
-            "defaultPrompt": [
-                "[TODO: Summarize my inbox and draft replies for me.]",
-                "[TODO: Find open bugs and turn them into tickets.]",
-                "[TODO: Review today's meetings and flag gaps.]",
-            ],
-            "brandColor": "[TODO: #3B82F6]",
-            "composerIcon": "[TODO: ./assets/icon.png]",
-            "logo": "[TODO: ./assets/logo.png]",
-            "screenshots": [
-                "[TODO: ./assets/screenshot1.png]",
-                "[TODO: ./assets/screenshot2.png]",
-                "[TODO: ./assets/screenshot3.png]",
-            ],
+            "displayName": display_name,
+            "shortDescription": f"Use {display_name} in Codex.",
+            "longDescription": f"{display_name} adds a local Codex plugin scaffold.",
+            "developerName": "Local developer",
+            "category": DEFAULT_CATEGORY,
+            "capabilities": [],
+            "defaultPrompt": f"Help me use {display_name}.",
         },
     }
+    if with_mcp:
+        payload["mcpServers"] = "./.mcp.json"
+    if with_apps:
+        payload["apps"] = "./.app.json"
+    return payload
 
 
 def build_marketplace_entry(
@@ -110,11 +101,11 @@ def load_json(path: Path) -> dict[str, Any]:
         return json.load(handle)
 
 
-def build_default_marketplace() -> dict[str, Any]:
+def build_default_marketplace(marketplace_name: str) -> dict[str, Any]:
     return {
-        "name": "[TODO: marketplace-name]",
+        "name": marketplace_name,
         "interface": {
-            "displayName": DEFAULT_MARKETPLACE_DISPLAY_NAME,
+            "displayName": display_name_from_plugin_name(marketplace_name),
         },
         "plugins": [],
     }
@@ -126,37 +117,65 @@ def validate_marketplace_interface(payload: dict[str, Any]) -> None:
         raise ValueError("marketplace.json field 'interface' must be an object.")
 
 
-def update_marketplace_json(
+def load_validated_marketplace(
     marketplace_path: Path,
+    marketplace_name: str | None,
     plugin_name: str,
-    install_policy: str,
-    auth_policy: str,
-    category: str,
     force: bool,
-) -> None:
+) -> dict[str, Any]:
     if marketplace_path.exists():
         payload = load_json(marketplace_path)
     else:
-        payload = build_default_marketplace()
+        payload = build_default_marketplace(marketplace_name or DEFAULT_MARKETPLACE_NAME)
 
     if not isinstance(payload, dict):
         raise ValueError(f"{marketplace_path} must contain a JSON object.")
 
     validate_marketplace_interface(payload)
 
+    existing_marketplace_name = payload.get("name")
+    if not isinstance(existing_marketplace_name, str) or not existing_marketplace_name.strip():
+        raise ValueError(f"{marketplace_path} must contain a non-empty string 'name'.")
+    validate_marketplace_name(existing_marketplace_name)
+
+    if marketplace_name is not None:
+        if existing_marketplace_name != marketplace_name:
+            raise ValueError(
+                f"{marketplace_path} already uses marketplace name "
+                f"'{existing_marketplace_name}'. Create a new marketplace file to use "
+                f"'{marketplace_name}' instead."
+            )
+
     plugins = payload.setdefault("plugins", [])
     if not isinstance(plugins, list):
         raise ValueError(f"{marketplace_path} field 'plugins' must be an array.")
+    if not force and any(
+        isinstance(entry, dict) and entry.get("name") == plugin_name for entry in plugins
+    ):
+        raise FileExistsError(
+            f"Marketplace entry '{plugin_name}' already exists in {marketplace_path}. "
+            "Use --force to overwrite that entry."
+        )
+
+    return payload
+
+
+def update_marketplace_json(
+    marketplace_path: Path,
+    marketplace_name: str | None,
+    plugin_name: str,
+    install_policy: str,
+    auth_policy: str,
+    category: str,
+    force: bool,
+) -> None:
+    payload = load_validated_marketplace(marketplace_path, marketplace_name, plugin_name, force)
+    plugins = payload["plugins"]
 
     new_entry = build_marketplace_entry(plugin_name, install_policy, auth_policy, category)
 
     for index, entry in enumerate(plugins):
         if isinstance(entry, dict) and entry.get("name") == plugin_name:
-            if not force:
-                raise FileExistsError(
-                    f"Marketplace entry '{plugin_name}' already exists in {marketplace_path}. "
-                    "Use --force to overwrite that entry."
-                )
             plugins[index] = new_entry
             break
     else:
@@ -185,15 +204,15 @@ def create_stub_file(path: Path, payload: dict, force: bool) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Create a plugin skeleton with placeholder plugin.json."
+        description="Create a plugin skeleton with a validation-ready plugin.json."
     )
     parser.add_argument("plugin_name")
     parser.add_argument(
         "--path",
         default=str(DEFAULT_PLUGIN_PARENT),
         help=(
-            "Parent directory for plugin creation (defaults to <cwd>/plugins). "
-            "When using a home-rooted marketplace, use <home>/plugins."
+            "Parent directory for plugin creation (defaults to <home>/plugins). "
+            "Pass an explicit repo path only when a repo/team plugin is intended."
         ),
     )
     parser.add_argument("--with-skills", action="store_true", help="Create skills/ directory")
@@ -206,7 +225,7 @@ def parse_args() -> argparse.Namespace:
         "--with-marketplace",
         action="store_true",
         help=(
-            "Create or update <cwd>/.agents/plugins/marketplace.json. "
+            "Create or update <home>/.agents/plugins/marketplace.json by default. "
             "Marketplace entries always point to ./plugins/<plugin-name> relative to the "
             "marketplace root."
         ),
@@ -215,8 +234,15 @@ def parse_args() -> argparse.Namespace:
         "--marketplace-path",
         default=str(DEFAULT_MARKETPLACE_PATH),
         help=(
-            "Path to marketplace.json (defaults to <cwd>/.agents/plugins/marketplace.json). "
-            "For a home-rooted marketplace, use <home>/.agents/plugins/marketplace.json."
+            "Path to marketplace.json (defaults to <home>/.agents/plugins/marketplace.json). "
+            "Pass a repo-rooted marketplace path only when a repo/team plugin is intended."
+        ),
+    )
+    parser.add_argument(
+        "--marketplace-name",
+        help=(
+            "Marketplace name to seed into a new marketplace.json. Use this only when the default "
+            "'personal' marketplace name is already taken and you need a different new marketplace."
         ),
     )
     parser.add_argument(
@@ -247,12 +273,24 @@ def main() -> None:
     if plugin_name != raw_plugin_name:
         print(f"Note: Normalized plugin name from '{raw_plugin_name}' to '{plugin_name}'.")
     validate_plugin_name(plugin_name)
+    marketplace_name = None
+    if args.marketplace_name is not None:
+        marketplace_name = args.marketplace_name.strip()
+        validate_marketplace_name(marketplace_name)
+
+    if args.with_marketplace:
+        marketplace_path = Path(args.marketplace_path).expanduser().resolve()
+        load_validated_marketplace(marketplace_path, marketplace_name, plugin_name, args.force)
 
     plugin_root = (Path(args.path).expanduser().resolve() / plugin_name)
     plugin_root.mkdir(parents=True, exist_ok=True)
 
     plugin_json_path = plugin_root / ".codex-plugin" / "plugin.json"
-    write_json(plugin_json_path, build_plugin_json(plugin_name), args.force)
+    write_json(
+        plugin_json_path,
+        build_plugin_json(plugin_name, with_mcp=args.with_mcp, with_apps=args.with_apps),
+        args.force,
+    )
 
     optional_directories = {
         "skills": args.with_skills,
@@ -281,9 +319,9 @@ def main() -> None:
         )
 
     if args.with_marketplace:
-        marketplace_path = Path(args.marketplace_path).expanduser().resolve()
         update_marketplace_json(
             marketplace_path,
+            marketplace_name,
             plugin_name,
             args.install_policy,
             args.auth_policy,

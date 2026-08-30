@@ -1,9 +1,9 @@
 use super::shared::default_enabled;
-use schemars::JsonSchema;
+use crate::JsonSchema;
+use crate::TS;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashMap;
-use ts_rs::TS;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
@@ -22,6 +22,45 @@ pub struct AppsListParams {
     /// When true, bypass app caches and fetch the latest data from sources.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub force_refetch: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+/// Read the committed installed connector runtime snapshot.
+pub struct AppsInstalledParams {
+    /// Optional loaded thread id used to evaluate effective app configuration.
+    #[ts(optional = nullable)]
+    pub thread_id: Option<String>,
+    /// When true and Apps are permitted, refresh and publish the hosted connector runtime tool
+    /// snapshot first.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub force_refresh: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+/// Installed connector runtime state.
+pub struct InstalledApp {
+    pub id: String,
+    /// Best-effort name carried by the runtime tool catalog. Canonical app metadata remains owned
+    /// by `app/read`.
+    pub runtime_name: Option<String>,
+    /// Effective enabled state after applying global, workspace, local, and managed configuration
+    /// at read time.
+    pub enabled: bool,
+    /// Whether the connector is enabled and has a non-synthetic, model-visible tool allowed by
+    /// effective MCP and app/tool policy in the committed runtime snapshot.
+    pub callable: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+/// The installed connectors in one committed runtime snapshot.
+pub struct AppsInstalledResponse {
+    pub apps: Vec<InstalledApp>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -68,7 +107,6 @@ pub struct AppMetadata {
     pub version: Option<String>,
     pub version_id: Option<String>,
     pub version_notes: Option<String>,
-    pub first_party_type: Option<String>,
     pub first_party_requires_install: Option<bool>,
     pub show_in_composer_when_unlinked: Option<bool>,
 }
@@ -83,6 +121,8 @@ pub struct AppInfo {
     pub description: Option<String>,
     pub logo_url: Option<String>,
     pub logo_url_dark: Option<String>,
+    pub icon_assets: Option<HashMap<String, String>>,
+    pub icon_dark_assets: Option<HashMap<String, String>>,
     pub distribution_channel: Option<String>,
     pub branding: Option<AppBranding>,
     pub app_metadata: Option<AppMetadata>,
@@ -102,6 +142,90 @@ pub struct AppInfo {
     pub plugin_display_names: Vec<String>,
 }
 
+impl AppInfo {
+    pub fn category(&self) -> Option<String> {
+        self.branding
+            .as_ref()
+            .and_then(|branding| non_empty_category(branding.category.as_deref()))
+            .or_else(|| {
+                self.app_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.categories.as_ref())
+                    .and_then(|categories| {
+                        categories
+                            .iter()
+                            .find_map(|category| non_empty_category(Some(category.as_str())))
+                    })
+            })
+    }
+}
+
+fn non_empty_category(category: Option<&str>) -> Option<String> {
+    let category = category?.trim();
+    if category.is_empty() {
+        None
+    } else {
+        Some(category.to_string())
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+/// EXPERIMENTAL - read metadata for specific apps/connectors.
+pub struct AppsReadParams {
+    /// App ids to read. The server accepts at most 100 ids and deduplicates repeated ids while
+    /// preserving their first-request order.
+    pub app_ids: Vec<String>,
+    /// Optional loaded thread id used to evaluate effective app configuration.
+    #[ts(optional = nullable)]
+    pub thread_id: Option<String>,
+    /// When true, include display-only public tool summaries in the returned metadata.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub include_tools: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+/// EXPERIMENTAL - metadata returned by app/read.
+pub struct AppToolSummary {
+    pub name: String,
+    pub title: Option<String>,
+    pub description: String,
+    #[serde(default = "default_enabled")]
+    pub is_enabled: bool,
+    pub disabled_reason: Option<String>,
+    #[serde(default)]
+    pub is_read_only: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+/// EXPERIMENTAL - metadata returned by app/read.
+pub struct ConnectorMetadata {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub icon_url: Option<String>,
+    pub icon_url_dark: Option<String>,
+    pub distribution_channel: Option<String>,
+    pub install_url: Option<String>,
+    #[serde(default)]
+    pub plugin_display_names: Vec<String>,
+    pub tool_summaries: Option<Vec<AppToolSummary>>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+/// EXPERIMENTAL - app/read response.
+pub struct AppsReadResponse {
+    pub apps: Vec<ConnectorMetadata>,
+    pub missing_app_ids: Vec<String>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
@@ -111,17 +235,18 @@ pub struct AppSummary {
     pub name: String,
     pub description: Option<String>,
     pub install_url: Option<String>,
-    pub needs_auth: bool,
+    pub category: Option<String>,
 }
 
 impl From<AppInfo> for AppSummary {
     fn from(value: AppInfo) -> Self {
+        let category = value.category();
         Self {
             id: value.id,
             name: value.name,
             description: value.description,
             install_url: value.install_url,
-            needs_auth: false,
+            category,
         }
     }
 }

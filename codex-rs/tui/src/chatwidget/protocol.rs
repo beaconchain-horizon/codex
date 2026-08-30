@@ -6,12 +6,17 @@ impl ChatWidget {
         notification: ServerNotification,
         replay_kind: Option<ReplayKind>,
     ) {
-        if self.active_side_conversation
-            && replay_kind.is_none()
-            && matches!(notification, ServerNotification::McpServerStatusUpdated(_))
+        // Reject misrouted child updates before shared notification handling mutates parent state.
+        if let ServerNotification::McpServerStatusUpdated(notification) = &notification
+            && let (Some(notification_thread_id), Some(thread_id)) =
+                (notification.thread_id.as_deref(), self.thread_id())
+            && notification_thread_id != thread_id.to_string()
         {
             return;
         }
+
+        let was_replaying_turn_completion = self.thread_usage.replaying_turn_completion;
+        self.thread_usage.replaying_turn_completion = replay_kind.is_some();
         let from_replay = replay_kind.is_some();
         let is_resume_initial_replay =
             matches!(replay_kind, Some(ReplayKind::ResumeInitialMessages));
@@ -50,6 +55,9 @@ impl ChatWidget {
             }
             ServerNotification::ThreadGoalCleared(notification) => {
                 self.on_thread_goal_cleared(notification.thread_id.as_str());
+            }
+            ServerNotification::ThreadSettingsUpdated(notification) => {
+                self.on_thread_settings_updated(notification);
             }
             ServerNotification::TurnStarted(notification) => {
                 self.turn_lifecycle.last_turn_id = Some(notification.turn.id);
@@ -141,9 +149,34 @@ impl ChatWidget {
             ServerNotification::ModelVerification(notification) => {
                 self.on_app_server_model_verification(&notification.verifications)
             }
+            ServerNotification::ModelSafetyBufferingUpdated(notification) => {
+                self.on_model_safety_buffering_updated(notification, replay_kind)
+            }
+            ServerNotification::AuthRecoveryStarted(notification) => {
+                self.add_info_message(notification.message, /*hint*/ None)
+            }
+            ServerNotification::AuthRecoveryCompleted(notification) => {
+                self.add_plain_history_lines(vec![
+                    vec!["✓ ".green(), notification.message.into()].into(),
+                ]);
+            }
             ServerNotification::Warning(notification) => self.on_warning(notification.message),
             ServerNotification::GuardianWarning(notification) => {
-                self.on_warning(notification.message)
+                if !notification
+                    .message
+                    .starts_with("Automatic approval review approved (")
+                {
+                    self.on_warning(notification.message);
+                }
+            }
+            ServerNotification::StrictReviewRequired(_) => {
+                self.app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
+                    history_cell::new_warning_event(
+                        "This request requires additional safety checks, some tool calls might take extra time"
+                            .to_string(),
+                    ),
+                )));
+                self.request_redraw();
             }
             ServerNotification::DeprecationNotice(notification) => {
                 self.on_deprecation_notice(notification.summary, notification.details)
@@ -182,63 +215,54 @@ impl ChatWidget {
                     self.on_shutdown_complete();
                 }
             }
-            ServerNotification::ThreadRealtimeStarted(notification) => {
-                if !from_replay {
-                    self.on_realtime_conversation_started(notification);
-                }
-            }
-            ServerNotification::ThreadRealtimeItemAdded(notification) => {
-                if !from_replay {
-                    self.on_realtime_item_added(notification);
-                }
-            }
-            ServerNotification::ThreadRealtimeOutputAudioDelta(notification) => {
-                if !from_replay {
-                    self.on_realtime_output_audio_delta(notification);
-                }
-            }
-            ServerNotification::ThreadRealtimeError(notification) => {
-                if !from_replay {
-                    self.on_realtime_error(notification);
-                }
-            }
-            ServerNotification::ThreadRealtimeClosed(notification) => {
-                if !from_replay {
-                    self.on_realtime_conversation_closed(notification);
-                }
-            }
-            ServerNotification::ThreadRealtimeSdp(notification) => {
-                if !from_replay {
-                    self.on_realtime_conversation_sdp(notification.sdp);
-                }
-            }
             ServerNotification::ServerRequestResolved(_)
             | ServerNotification::AccountUpdated(_)
             | ServerNotification::AccountRateLimitsUpdated(_)
             | ServerNotification::ThreadStarted(_)
             | ServerNotification::ThreadStatusChanged(_)
+            | ServerNotification::ThreadReverted(_)
+            | ServerNotification::ThreadQueueChanged(_)
             | ServerNotification::ThreadArchived(_)
+            | ServerNotification::ThreadDeleted(_)
             | ServerNotification::ThreadUnarchived(_)
             | ServerNotification::RawResponseItemCompleted(_)
+            | ServerNotification::RawResponseCompleted(_)
             | ServerNotification::CommandExecOutputDelta(_)
             | ServerNotification::ProcessOutputDelta(_)
             | ServerNotification::ProcessExited(_)
+            | ServerNotification::McpServerEventStream(_)
             | ServerNotification::FileChangePatchUpdated(_)
             | ServerNotification::McpToolCallProgress(_)
             | ServerNotification::McpServerOauthLoginCompleted(_)
             | ServerNotification::AppListUpdated(_)
+            | ServerNotification::EnvironmentConnected(_)
+            | ServerNotification::EnvironmentDisconnected(_)
             | ServerNotification::RemoteControlStatusChanged(_)
+            | ServerNotification::ExternalAgentConfigImportProgress(_)
             | ServerNotification::ExternalAgentConfigImportCompleted(_)
             | ServerNotification::FsChanged(_)
+            | ServerNotification::TurnModerationMetadata(_)
             | ServerNotification::FuzzyFileSearchSessionUpdated(_)
             | ServerNotification::FuzzyFileSearchSessionCompleted(_)
+            | ServerNotification::ThreadRealtimeStarted(_)
+            | ServerNotification::ThreadRealtimeItemAdded(_)
+            | ServerNotification::ThreadRealtimeItemStarted(_)
+            | ServerNotification::ThreadRealtimeItemTranscriptDelta(_)
+            | ServerNotification::ThreadRealtimeItemCompleted(_)
+            | ServerNotification::ThreadRealtimeOutputAudioDelta(_)
+            | ServerNotification::ThreadRealtimeError(_)
+            | ServerNotification::ThreadRealtimeClosed(_)
+            | ServerNotification::ThreadRealtimeSdp(_)
             | ServerNotification::ThreadRealtimeTranscriptDelta(_)
             | ServerNotification::ThreadRealtimeTranscriptDone(_)
             | ServerNotification::WindowsWorldWritableWarning(_)
             | ServerNotification::WindowsSandboxSetupCompleted(_)
-            | ServerNotification::AccountLoginCompleted(_) => {}
+            | ServerNotification::AccountLoginCompleted(_)
+            | ServerNotification::ProjectChanged(_)
+            | ServerNotification::ThreadProjectUpdated(_) => {}
             ServerNotification::ContextCompacted(_) => {}
         }
+        self.thread_usage.replaying_turn_completion = was_replaying_turn_completion;
     }
 
     pub(super) fn handle_turn_completed_notification(
@@ -246,14 +270,51 @@ impl ChatWidget {
         notification: TurnCompletedNotification,
         replay_kind: Option<ReplayKind>,
     ) {
+        // User-message dedupe only suppresses the app-server echo of a prompt
+        // this TUI already rendered locally. Once that turn ends, another
+        // client can submit the same text and it still needs its own user cell.
+        self.last_rendered_user_message_display = None;
+        let was_replaying_turn_completion = self.thread_usage.replaying_turn_completion;
+        self.thread_usage.replaying_turn_completion = replay_kind.is_some();
         match notification.turn.status {
             TurnStatus::Completed => {
+                let last_agent_message =
+                    notification
+                        .turn
+                        .items
+                        .iter()
+                        .rev()
+                        .find_map(|item| match item {
+                            ThreadItem::AgentMessage {
+                                id,
+                                text,
+                                phase: Some(MessagePhase::FinalAnswer) | None,
+                                ..
+                            } => Some((item.clone(), id.clone(), text.clone())),
+                            _ => None,
+                        });
+                if let Some((item, id, _)) = &last_agent_message
+                    && self
+                        .transcript
+                        .last_completed_agent_message
+                        .as_ref()
+                        .is_none_or(|(turn_id, item_id)| {
+                            turn_id != &notification.turn.id || item_id != id
+                        })
+                {
+                    self.handle_thread_item(
+                        item.clone(),
+                        notification.turn.id.clone(),
+                        replay_kind
+                            .map_or(ThreadItemRenderSource::Live, ThreadItemRenderSource::Replay),
+                    );
+                }
                 self.last_non_retry_error = None;
                 self.on_task_complete(
-                    /*last_agent_message*/ None,
+                    last_agent_message.map(|(_, _, text)| text),
                     notification.turn.duration_ms,
                     replay_kind.is_some(),
-                )
+                );
             }
             TurnStatus::Interrupted => {
                 self.last_non_retry_error = None;
@@ -285,6 +346,7 @@ impl ChatWidget {
             }
             TurnStatus::InProgress => {}
         }
+        self.thread_usage.replaying_turn_completion = was_replaying_turn_completion;
     }
 
     fn handle_item_started_notification(
@@ -298,10 +360,10 @@ impl ChatWidget {
                 self.on_patch_apply_begin(file_update_changes_to_display(changes));
             }
             item @ ThreadItem::McpToolCall { .. } => self.on_mcp_tool_call_started(item),
-            ThreadItem::WebSearch { id, .. } => {
-                self.on_web_search_begin(id);
+            ThreadItem::WebSearch(item) => {
+                self.on_web_search_begin(item.id);
             }
-            ThreadItem::ImageGeneration { .. } => {
+            ThreadItem::ImageGeneration(_) => {
                 self.on_image_generation_begin();
             }
             ThreadItem::CollabAgentToolCall {
@@ -325,10 +387,8 @@ impl ChatWidget {
                 reasoning_effort,
                 agents_states,
             }),
-            ThreadItem::EnteredReviewMode { review, .. } => {
-                if !from_replay {
-                    self.enter_review_mode_with_hint(review, /*from_replay*/ false);
-                }
+            ThreadItem::EnteredReviewMode { review, .. } if !from_replay => {
+                self.enter_review_mode_with_hint(review, /*from_replay*/ false);
             }
             _ => {}
         }
@@ -339,10 +399,13 @@ impl ChatWidget {
         notification: ItemCompletedNotification,
         replay_kind: Option<ReplayKind>,
     ) {
-        self.handle_thread_item(
-            notification.item,
-            notification.turn_id,
-            replay_kind.map_or(ThreadItemRenderSource::Live, ThreadItemRenderSource::Replay),
-        );
+        match notification.item {
+            item @ ThreadItem::CommandExecution { .. } => self.on_command_execution_completed(item),
+            item => self.handle_thread_item(
+                item,
+                notification.turn_id,
+                replay_kind.map_or(ThreadItemRenderSource::Live, ThreadItemRenderSource::Replay),
+            ),
+        }
     }
 }
